@@ -245,6 +245,7 @@ a.chip:hover { border-color: var(--marker); color: var(--marker); }
 .attempts th { text-align: left; font-size: 0.8rem; color: var(--ink-soft); font-weight: 600; padding: 0.5rem 0.75rem; border-bottom: 2px solid var(--ink); }
 .attempts td { padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--rule); font-variant-numeric: tabular-nums; }
 .row-actions { text-align: right; white-space: nowrap; }
+.row-actions > * + * { margin-left: 0.4rem; }
 
 /* ---- Practice ---- */
 

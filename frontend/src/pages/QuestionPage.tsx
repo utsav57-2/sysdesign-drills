@@ -14,6 +14,8 @@ export default function QuestionPage() {
   const [showSolution, setShowSolution] = useState(false)
   const [starting, setStarting] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
+  const [confirming, setConfirming] = useState<number | null>(null)
+  const [rowError, setRowError] = useState<string | null>(null)
 
   useEffect(() => {
     api.attempts(id).then(setAttempts, () => {})
@@ -34,6 +36,28 @@ export default function QuestionPage() {
       setStartError((e as Error).message)
       setStarting(false)
     }
+  }
+
+  const replace = (a: Attempt) => setAttempts((list) => list.map((x) => (x.id === a.id ? a : x)))
+
+  const end = async (a: Attempt) => {
+    setRowError(null)
+    try {
+      replace(await api.updateAttempt(a.id, { status: 'completed' }))
+    } catch (e) {
+      setRowError((e as Error).message)
+    }
+  }
+
+  const remove = async (attemptId: number) => {
+    setRowError(null)
+    try {
+      await api.deleteAttempt(attemptId)
+      setAttempts((list) => list.filter((x) => x.id !== attemptId))
+    } catch (e) {
+      setRowError((e as Error).message)
+    }
+    setConfirming(null)
   }
 
   const inProgress = attempts.find((a) => a.status === 'in_progress')
@@ -143,12 +167,28 @@ export default function QuestionPage() {
                   <td>{a.status === 'completed' ? 'Finished' : 'In progress'}</td>
                   <td>{formatDuration(a.elapsedSeconds)}</td>
                   <td><ScoreBadge score={a.bestScore} /></td>
-                  <td><Link to={`/practice/${a.id}`}>Open</Link></td>
+                  <td className="row-actions">
+                    {confirming === a.id ? (
+                      <>
+                        <button className="danger small" onClick={() => remove(a.id)}>Delete for good</button>
+                        <button className="ghost small" onClick={() => setConfirming(null)}>Keep</button>
+                      </>
+                    ) : (
+                      <>
+                        <Link to={`/practice/${a.id}`}>Open</Link>
+                        {a.status === 'in_progress' && (
+                          <button className="ghost small" onClick={() => end(a)}>{a.mode === 'mock' ? 'End' : 'Finish'}</button>
+                        )}
+                        <button className="ghost small" onClick={() => setConfirming(a.id)}>Delete</button>
+                      </>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
+        {rowError && <p className="error small">{rowError}</p>}
       </section>
     </main>
   )

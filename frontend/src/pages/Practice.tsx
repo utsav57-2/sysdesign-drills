@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, type Answers, type Attempt, type ChatMessage, type Config, type Feedback, type StageId } from '../api'
 import { formatDuration, useBank } from '../data'
 import { STAGES } from '../stages'
@@ -14,6 +14,7 @@ type SaveState = 'saved' | 'saving' | 'unsaved' | 'error'
 
 export default function Practice() {
   const attemptId = Number(useParams().attemptId)
+  const navigate = useNavigate()
   const { bank } = useBank()
 
   const [attempt, setAttempt] = useState<Attempt | null>(null)
@@ -30,6 +31,8 @@ export default function Practice() {
   const [grading, setGrading] = useState(false)
   const [gradeError, setGradeError] = useState<string | null>(null)
   const [peeked, setPeeked] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
 
   // Latest values for the save loop, which runs outside React renders.
   const latest = useRef({ answers, scene, elapsed })
@@ -37,6 +40,7 @@ export default function Practice() {
   const dirty = useRef(false)
   const saveTimer = useRef<number | undefined>(undefined)
   const sentScene = useRef<string | null>(null)
+  const deleted = useRef(false)
 
   useEffect(() => {
     Promise.all([api.attempt(attemptId), api.messages(attemptId), api.feedback(attemptId), api.config()])
@@ -56,7 +60,7 @@ export default function Practice() {
   const flush = useCallback(async () => {
     window.clearTimeout(saveTimer.current)
     const { answers, scene, elapsed } = latest.current
-    if (!answers) return
+    if (!answers || deleted.current) return
     dirty.current = false
     setSaveState('saving')
     try {
@@ -143,10 +147,32 @@ export default function Practice() {
   }
 
   const toggleFinished = async () => {
-    await flush()
-    const status = attempt.status === 'completed' ? 'in_progress' : 'completed'
-    setAttempt(await api.updateAttempt(attemptId, { status }))
+    setActionError(null)
+    try {
+      await flush()
+      const status = attempt.status === 'completed' ? 'in_progress' : 'completed'
+      setAttempt(await api.updateAttempt(attemptId, { status }))
+    } catch (e) {
+      setActionError((e as Error).message)
+    }
   }
+
+  const remove = async () => {
+    setActionError(null)
+    window.clearTimeout(saveTimer.current)
+    deleted.current = true
+    try {
+      await api.deleteAttempt(attemptId)
+      navigate(`/questions/${attempt.questionId}`, { replace: true })
+    } catch (e) {
+      deleted.current = false
+      setConfirmDelete(false)
+      setActionError((e as Error).message)
+    }
+  }
+
+  const ended = attempt.status === 'completed'
+  const isMock = attempt.mode === 'mock'
 
   const filled = (id: StageId) => (id === 'highLevel' ? answers.highLevel.trim() !== '' || scene !== '' : answers[id].trim() !== '')
 
@@ -165,7 +191,20 @@ export default function Practice() {
             {formatDuration(elapsed)}
             <small> / {targetSeconds / 60}:00</small>
           </span>
-          <button onClick={toggleFinished}>{attempt.status === 'completed' ? 'Reopen attempt' : 'Mark as finished'}</button>
+          {actionError && <span className="error small">{actionError}</span>}
+          {confirmDelete ? (
+            <>
+              <button className="danger" onClick={remove}>Delete for good</button>
+              <button className="ghost" onClick={() => setConfirmDelete(false)}>Keep</button>
+            </>
+          ) : (
+            <button className="ghost" onClick={() => setConfirmDelete(true)} title="Delete this attempt, its chat and feedback">
+              Delete
+            </button>
+          )}
+          <button onClick={toggleFinished}>
+            {ended ? (isMock ? 'Resume interview' : 'Reopen attempt') : isMock ? 'End interview' : 'Mark as finished'}
+          </button>
           <button className="primary" onClick={grade} disabled={grading || !aiReady} title={aiReady ? '' : 'Needs an Anthropic API key'}>
             {grading ? 'Grading…' : 'Get feedback'}
           </button>
@@ -242,7 +281,7 @@ export default function Practice() {
           )}
 
           {panel === 'chat' ? (
-            <Chat attemptId={attemptId} messages={messages} onMessages={setMessages} getDiagram={diagramIfChanged} beforeSend={flush} disabled={!aiReady} mode={attempt.mode} stage={stage} onStage={setStage} />
+            <Chat attemptId={attemptId} messages={messages} onMessages={setMessages} getDiagram={diagramIfChanged} beforeSend={flush} disabled={!aiReady} ended={ended} mode={attempt.mode} stage={stage} onStage={setStage} />
           ) : panel === 'solution' ? (
             <div className="feedback-panel">
               {attempt.status === 'completed' || feedback.length > 0 || peeked ? (

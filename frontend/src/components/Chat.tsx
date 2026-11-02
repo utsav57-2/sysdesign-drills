@@ -11,6 +11,8 @@ interface Props {
   getDiagram: () => Promise<string>
   beforeSend: () => Promise<void>
   disabled: boolean
+  /** The attempt was ended; the chat is read-only until it's resumed. */
+  ended: boolean
   mode: 'practice' | 'mock'
   stage: StageId
   onStage: (stage: StageId) => void
@@ -22,12 +24,13 @@ const STARTERS = [
   'Can you review my API before I move on?',
 ]
 
-export default function Chat({ attemptId, messages, onMessages, getDiagram, beforeSend, disabled, mode, stage, onStage }: Props) {
+export default function Chat({ attemptId, messages, onMessages, getDiagram, beforeSend, disabled: noKey, ended, mode, stage, onStage }: Props) {
   const [draft, setDraft] = useState('')
   const [pending, setPending] = useState<string | null>(null)
   const [streaming, setStreaming] = useState('')
   const [error, setError] = useState<string | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
+  const disabled = noKey || ended
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: 'end' })
@@ -117,7 +120,13 @@ export default function Chat({ attemptId, messages, onMessages, getDiagram, befo
               send(draft)
             }
           }}
-          placeholder={disabled ? 'Add an Anthropic API key to talk to the interviewer' : 'Ask a question or explain a decision'}
+          placeholder={
+            ended
+              ? 'This attempt has ended. Resume it to keep talking.'
+              : noKey
+                ? 'Set ANTHROPIC_API_KEY and restart the server to talk to the interviewer'
+                : 'Ask a question or explain a decision'
+          }
           rows={2}
           disabled={disabled || !!pending}
         />

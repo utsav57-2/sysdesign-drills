@@ -126,7 +126,7 @@ export default function History() {
                   <td className="row-actions">
                     {confirming === a.id ? (
                       <>
-                        <button className="danger small" onClick={() => remove(a.id)}>Delete attempt</button>
+                        <button className="danger small" onClick={() => remove(a.id)}>Delete for good</button>
                         <button className="ghost small" onClick={() => setConfirming(null)}>Keep</button>
                       </>
                     ) : (
