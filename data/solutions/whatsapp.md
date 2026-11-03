@@ -142,6 +142,64 @@ A WebSocket starts as an HTTP request with `Upgrade: websocket`; the server answ
 
 - Upload directly to object storage with a presigned URL (client-side encrypted in an E2EE design); the message references `mediaId`. Recipients download through the CDN. Generate thumbnails asynchronously.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Messages and inboxes: Cassandra/ScyllaDB** (see the follow-up for why). The extra point here is the delete pattern: in the delete-after-delivery model nearly every inbox row is written and then deleted within seconds, which in an LSM store means tombstones. Use TTLs on inbox rows plus a time-window compaction strategy, or keep hot inbox entries in Redis with a Cassandra backstop, otherwise reads slow down as tombstones pile up.
+- **Users, devices, chat membership: a relational DB** (or a strongly consistent KV store). It's small next to messages, needs uniqueness (one account per phone number) and atomic membership changes (add/remove a group member and bump the group's version together). Rejected for messages because 1.2M writes/s with no joins is not what a relational DB is good at.
+- **Connection registry and presence: Redis with TTLs.** Pure soft state, rebuilt by heartbeats.
+- **ACID vs BASE:** a single message write must be durable and acknowledged at `QUORUM`/`LOCAL_QUORUM` before the sender sees one check mark; that's the "acked is never lost" guarantee. The per-chat `seq` must be assigned by a single owner (atomic counter or one partition per chat). Everything else is BASE: receipts, presence, typing, "last seen" can be late or lost.
+- **CAP:** message persistence is **CP per chat**: if a quorum isn't reachable, don't ack; the client retries. Delivery, presence and receipts are **AP**. The business reason: a phantom check mark on a lost message destroys trust; a late blue tick doesn't.
+
+### Service boundaries and communication
+
+- **Chat servers** (stateful, hold sockets) are separate from **storage** and **push** so you can deploy and drain chat servers without touching data. **Group service** owns membership; **media service** only issues presigned URLs; **key server** for E2EE pre-keys.
+- **Don't split per feature on the socket path:** receipts, typing and messages share one connection and one server process; extra hops would eat the 500 ms budget.
+- **Synchronous:** sender → chat server → durable write → ack (the client must know it's safe). **Asynchronous:** fan-out to recipients via pub/sub, push notifications, receipts, thumbnail generation, and large-group fan-out, which runs from a queue so a 1,000-member group doesn't hold up the sender's ack.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Chat server crash (1M sockets) | Mass reconnect storm | Clients reconnect with exponential backoff + jitter (see follow-up); LB admission control limits new handshakes per second per server |
+| Cassandra replica slow | Sender ack latency rises | Write timeout ~200 ms with speculative retry; idempotent on (`sender_device`, `clientMsgId`) so client retries are safe |
+| Pub/sub drops a message (Redis at-most-once) | Recipient doesn't see it live | Inbox is the source of truth; client sync on reconnect and on `seq` gap detection catches it |
+| APNs/FCM degraded | Offline users not notified | Circuit breaker per provider, retry with backoff, coalesce pushes per device; messages wait safely in inbox |
+| Large-group fan-out spike | Fan-out workers lag, 1:1 latency suffers | Bulkhead: separate worker pools and queues for group fan-out vs 1:1 delivery; shed typing/presence events first under load |
+| Region-wide New Year's spike (3M/s) | Storage write saturation | Graceful degradation: delay read receipts and presence, keep message persistence; autoscale chat servers ahead of known peaks |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the per-chat sequence owner (if a single Redis counter, losing it stalls that chat's sends; use a replicated counter or derive `seq` from a conditional write in the store), and the connection registry (replicated Redis; worst case, fall back to pub/sub broadcast or push).
+- **Replication:** Cassandra RF=3 across zones in each region with `LOCAL_QUORUM`; asynchronous replication to a second region.
+- **Multi-region:** users are homed in a region near them. Cross-region chats write to the chat's home region; that adds latency for some pairs but keeps ordering simple.
+- **RPO/RTO:** zone failure: RPO 0 for acked messages (quorum spans zones), RTO seconds as clients reconnect. Region failure: RPO of a few seconds for undelivered messages (async replication), RTO ~10–15 minutes. Justification: under the delete-after-delivery model, the server holds only undelivered messages, so the damage window is small, and senders still have their copy and can resend.
+- **Backups:** in the WhatsApp model, the server deliberately doesn't keep long-term history, so backups cover users, groups and keys; message history backup is the client's job.
+
+### Security
+
+- **Authn:** phone number verification issues a device credential; each socket authenticates with it. Every device has its own identity key for E2EE.
+- **Authz:** the server checks the sender is a current member of `chat_id` before accepting a message and before fan-out; membership changes are audit-logged.
+- **Encryption:** E2EE for content (follow-up), TLS on sockets, encryption at rest for inboxes and media even though they're ciphertext, since metadata (who talks to whom, when) is itself sensitive.
+- **Key handling:** the server stores only public identity and pre-keys; clients alert when a contact's identity key changes. Server-side secrets (push credentials, DB creds) rotate through a secrets manager.
+- **PII:** phone numbers and contact graphs. Minimize metadata retention; delete inbox rows on delivery.
+- **Abuse:** rate-limit sends per account, especially new ones; cap forwards; throttle group creation and adds of non-contacts (see follow-up).
+
+### Observability
+
+- **SLIs/SLOs:** 99.9% of messages acked to the sender within 300 ms; 99% delivered to an online recipient within 500 ms, measured by recipient-side ack timestamps; zero acked messages lost (a reconciliation job samples inboxes against sender acks); 99.95% socket connect success.
+- **Dashboards:** messages/s, active sockets per server, reconnect rate, inbox backlog age (oldest undelivered message for online devices is a strong symptom), pub/sub lag, push success rate per provider, Cassandra write latency per zone.
+- **Tracing:** sample message lifecycles by `message_id` (ack → publish → deliver → receipt), carrying no content.
+- **Paging:** burn rate on ack latency and delivery latency, and reconnect-rate spikes. A single node failure is not a page.
+
+### Performance and cost
+
+- **Bottleneck:** storage write throughput: each 1:1 message is a message write, an inbox write and an inbox delete, so ~3× the 1.2M msg/s, ~3.6M ops/s average and ~9M at the 3M/s peak, before group fan-out. Batch inbox deletes from `ackDelivered`. In the delete-after-delivery model, store the body directly in the device inbox row for 1:1 chats, which drops one write per message; the trade-off is that groups would copy the body once per member device, so keep the shared message row there.
+- **Connections:** ~1M sockets per tuned server, ~200–400 servers; memory per connection is the lever (small buffers, TLS session reuse). Fewer, bigger servers are cheaper but each crash disconnects more users.
+- **Storage:** delete-after-delivery keeps the store tiny. The 30-day alternative is 10 TB/day × 30 ≈ 300 TB, ~900 TB at RF=3, which is the cost of offering server-side history.
+- **Media** dominates bytes: dedupe forwarded media by content hash (only possible without per-recipient encryption, so it's a privacy trade-off), compress on the client, and expire media after delivery.
+
 ## Follow-up questions
 
 ### How does end-to-end encryption change the design?

@@ -245,6 +245,65 @@ The close job only finalizes state:
 
 **Sniping:** eBay uses a fixed (hard) end time, which rewards last-second bids. A "soft close" alternative extends `ends_at` by, say, 2 minutes whenever a bid lands in the final 2 minutes: do it in the same conditional update with `ends_at = GREATEST(ends_at, now() + interval '2 minutes')` and push the new end time over SSE.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres, sharded by `auction_id`, for auctions, bids and outbox.** The core operation is "compare-and-set the max bid, append the bid, emit an event" atomically, and an accepted bid must never be lost. That's an ACID transaction on one shard with synchronous replication. Load is modest (230 bids/s average, ~2,300/s peak, 1.5 TB/year), so a relational store's write ceiling isn't a concern. DynamoDB with `ConditionExpression` plus a transaction is a reasonable alternative; Cassandra was rejected because its lightweight transactions (Paxos-based compare-and-set) are slower and don't extend atomically to the bid and outbox rows.
+- **What needs ACID:** the auction row, accepted bids, the outbox row, auction status changes and idempotency keys. These decide who wins and what someone owes.
+- **Where BASE is fine:** the live price on viewers' screens, "my bids" (filled from Kafka), search over active auctions, bid history caches, notifications. A viewer seeing 105 a second after it became 110 is harmless because the write path rejects stale bids anyway.
+- **CAP stance:** the bid path is **CP**. If a shard's primary is unreachable, bids on its auctions get 503 rather than being accepted somewhere they could be lost or duplicated; the business cost of a wrong winner (disputes, refunds, trust) is far worse than a minute of rejected bids. Viewing and browsing are **AP**: serve cached state with its version.
+
+### Service boundaries and communication
+
+- **Auction service** (listing CRUD), **bid service** (hot, correctness-critical writes), **close scheduler**, **fan-out and SSE tier**, **notification service**. The bid service is split from listings so a surge of bids can be scaled and protected on its own; the SSE tier is split because 2M connections scale with viewers, not bids.
+- **Synchronous:** placing a bid (client needs accepted/outbid/closed now), creating a listing, reading an auction.
+- **Asynchronous:** everything downstream of a commit, via outbox → Kafka: live updates, outbid notifications, "my bids", search indexing, handing a sold item to payments. Making these synchronous would put email and push providers on the bid's latency path and let their outages fail bids.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Postgres shard primary fails | Bids on that shard fail until failover | Promote the synchronous standby (no committed bid lost); clients **retry with backoff and jitter** using the same idempotency key, so a bid that committed just before the crash isn't placed twice |
+| Outage overlaps auction end times | Bidders couldn't bid in the final seconds | Extend `ends_at` for affected auctions by the outage length plus a margin before reopening; a fairness rule, not just a technical one |
+| Outbox relay or Kafka lag | Live prices freeze, outbid emails late | Relay runs as several instances with leader election; alert on outbox age; clients refetch on version gaps. Bids still commit |
+| Hot auction saturates its row (~100 bids/s) | Bid latency climbs for that shard | Losing bids fail fast; per-bidder rate limits; switch that auction to the single-writer queue; per-shard connection pool limits act as a **bulkhead** so one hot item doesn't starve its neighbors |
+| Notification provider down | Outbid/won messages fail | **Circuit breaker** on the provider, retries with backoff, **DLQ** after N attempts; email is not on the bid path |
+| Close scheduler misses a timer | Winner not declared | Polling query every second as a safety net; close is idempotent via conditional status update |
+
+### High availability and disaster recovery
+
+- **SPOFs:** each shard's primary (synchronous standby in another zone, automatic failover), the close scheduler (multiple workers with `SKIP LOCKED`), the outbox relay, Redis pub/sub (replicated; a lost channel only delays live updates). SSE servers are interchangeable.
+- **Zone vs region:** multi-zone, with each auction's shard homed in one region. Bids for one auction must serialize through one primary, so active-active across regions would need cross-region consensus and add ~100 ms per bid. Instead, keep an async replica in a second region for disaster recovery.
+- **Targets:** accepted bids **RPO = 0** within a region (synchronous standby), **RTO under 1 minute** for zone failure. Region failure: **RPO of seconds, RTO of ~30 minutes**, with affected auctions paused and extended, since a lost bid that a user saw accepted is the worst outcome. Daily backups plus WAL archiving for point-in-time recovery cover bad deploys.
+
+### Security
+
+- **Authn/authz:** token auth; bidder ID from the token. Sellers can't bid on their own auctions (shill bidding), checked in the bid service. Only the seller can edit or cancel, and only before the first bid.
+- **Privacy:** bidder identities are masked publicly; reserve prices and proxy-bid maximums are secret and never sent to clients, since leaking a maximum lets others bid exactly up to it.
+- **Encryption:** TLS everywhere; at-rest encryption for the bid database and backups. Credentials from a secrets manager with automatic rotation.
+- **Audit:** bids are already an append-only log; also audit admin actions (cancelling auctions, voiding bids, extending end times) with actor and reason, since these settle disputes.
+- **Abuse:** per-user and per-auction bid rate limits, bot detection for sniping scripts, and account-age or verification requirements for high-value auctions to deter fake winning bids.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 99.9% of bid requests get a definitive answer (accepted, outbid or closed) within 500 ms.
+- 99% of accepted bids reach connected viewers within 1 s of commit.
+- 99.99% of auctions are finalized within 10 s of `ends_at`.
+
+**Metrics:** bid accept/409/410 ratios, conditional-write latency per shard, outbox backlog age, Kafka lag, SSE connections and push latency, auctions past `ends_at` still open.
+
+**Tracing:** bid request → transaction → outbox → Kafka → pub/sub → SSE push, keyed by `bid_id`, to find where the 1 s budget goes.
+
+**Paging:** burn rate on bid success and latency, and any auction open more than 60 s past its end time (a correctness symptom). A rising 409 rate is normal at auction close and should not page.
+
+### Performance and cost
+
+- **Main bottleneck:** row contention on hot auctions in their last seconds. Conditional writes keep the critical section to one statement; pooling connections per shard avoids connection storms; the single-writer queue is the escape hatch.
+- **Cost drivers are small by comparison with feed-style systems.** The SSE tier (~40 servers for 2M viewers) is the largest fleet; levers are raising connections per server (fewer servers, bigger blast radius) and closing streams for background tabs. Synchronous cross-zone replication roughly doubles database spend and adds a few ms per commit; it's the price of "no lost bids" and worth paying.
+- **Storage:** 4 GB/day of bids, ~1.5 TB/year before replicas. Move closed auctions' bids older than a year to cheaper storage or object storage; the trade-off is slower dispute lookups.
+
 ## Follow-up questions
 
 ### Why not hold the highest bid in Redis and use a Lua script?

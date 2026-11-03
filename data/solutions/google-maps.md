@@ -221,6 +221,65 @@ Free-flow on the highway (100 km/h) would give 10.8 min there and 15.2 min overa
 - Long cross-region trips use a coarse top-level graph of highways and region boundaries, then local graphs at each end.
 - Cache popular origin–destination pairs at coarse precision for a minute, which helps commute peaks.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Map database (roads, places): a relational or graph-shaped editing store with ACID.** Map edits (a new road, a turn restriction) touch several related rows and go through review, so they need transactions and history. It is low volume and never on the request path; tiles and routing graphs are *derived* from it in batch.
+- **Tiles: blob storage behind a CDN.** ~7 TB of immutable, versioned objects keyed by `(version, z, x, y)`. A database would add cost and latency for data that never changes after publication.
+- **Routing graph: in-memory on routers, built offline.** ~16 GB of edges plus CH shortcuts must be read millions of times per query batch; no external store can match local memory.
+- **Segment speeds: in-memory/Redis, BASE.** Overwritten every minute, last-writer-wins, no transactions. A router reading speeds one minute old is fine; the requirement itself is "within 1–2 minutes".
+- **CAP stance:** everything user-facing is **AP**. Serving a slightly stale tile or ETA beats an error on a phone mid-drive. The only place we want strong consistency is the map edit pipeline, and the versioned tile URL means clients never see a half-published release.
+
+### Service boundaries and communication
+
+- **Tile serving** (CDN + blob storage), **Routing service** (sharded by region), **Probe ingest**, **Traffic stream processor**, and offline **Tile builder** and **Graph builder**. Tiles and routing are split because their failure tolerance differs ("maps must keep rendering even if routing degrades") and their scaling units differ (CDN bandwidth vs CPU and RAM).
+- **Synchronous:** tile fetches and `GET /directions`. Inside a route request, snapping, CH search and speeds are in-process; routers hold speeds locally rather than calling a speeds service per request.
+- **Asynchronous:** probes (`202`, batched every ~30 s) → Kafka → stream processor → speeds published every minute → routers pull. Map edits → batch rebuilds → new versions. Traffic is inherently a lagging aggregate, so async costs nothing in product terms and decouples 1M events/s from the query path.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Routing shard overloaded at commute peak | Slow or failed directions | Load shedding (drop alternative-route computation first, then reject with retry-after); per-region autoscaling of replicas; client retries with backoff + jitter |
+| Traffic pipeline stalls (Kafka lag, Flink crash) | Live speeds go stale | Graceful degradation to historical profiles as live speeds age (see follow-ups); Flink restarts from checkpoints; alert on speed freshness |
+| Bad graph or tile release | Wrong routes or broken map for a region | Canary new graph on a few replicas and compare route quality on replayed queries; tile versions in URLs make rollback a pointer flip |
+| Cross-region routing tier slow | Long trips time out | Strict timeout on the cross-region call; fall back to a route via the coarse highway graph with historical ETAs |
+| Malformed or spoofed probe batches | Stream processor errors or poisoned speeds | Validate at ingest, route unparseable batches to a dead-letter topic; require minimum distinct sessions per segment before trusting a speed |
+
+### High availability and disaster recovery
+
+- **SPOFs:** a region's routing shard (removed with N+2 replicas across zones), the Kafka cluster (replication factor 3 across zones), and the graph/tile builders (batch jobs; losing them delays updates but serves nothing live).
+- **Zone vs region:** routers are regional by design, each with replicas in three zones. Because the graph is a build artifact, a second region can host a standby copy of any shard's graph and take over by DNS/gateway routing. Tiles are already globally distributed by the CDN with blob storage replicated to two regions.
+- **RPO/RTO:** tiles and graphs have effectively **RPO 0** (rebuildable from the map DB and stored versions); live speeds have no meaningful RPO because a new minute replaces them, and probes can be lost without user harm. Map database **RPO ≤ 5 minutes**, since edits are curated work. **RTO:** tiles ~0 (CDN), routing **≤ 5 minutes** for a region failover (load the graph from object storage into warm standbys), traffic **≤ 15 minutes** with historical fallback meanwhile.
+- **Backups:** map database snapshots, plus prior graph and tile builds kept for rollback.
+
+### Security
+
+- **Authn/authz:** API keys or OAuth for third-party and app clients; signed tile URLs or key checks at the CDN to stop unlicensed bulk scraping.
+- **Privacy is the main concern:** probes are location traces. Rotating session IDs, trip-end trimming and deletion after aggregation are covered in follow-ups; also encrypt probes in transit and in Kafka at rest, keep raw retention to hours, and restrict who can query raw topics.
+- **Secrets and audit:** CDN and API signing keys in a secret manager, rotated with an overlap window. Map edits and access to raw probe data are audit-logged.
+- **Abuse:** per-key rate limits and quotas on directions (a cheap request for the client but CPU for us); probe-injection attacks (e.g. many fake phones faking a jam) mitigated by device attestation, per-session rate limits and requiring agreement across many independent sessions.
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of tile requests served in under 200 ms at the edge.
+  - 99.9% of directions requests return in under 1 s.
+  - 99% of segment speeds on major roads are under 2 minutes old.
+  - ETA accuracy: 90% of completed trips arrive within ±10% of the predicted ETA.
+- **Dashboards:** CDN hit ratio and origin requests/s, router p99 and settled nodes per region, Kafka lag, speed freshness, ETA error by region.
+- **Traces:** sampled directions requests (gateway → snap → CH → speeds → unpack); cross-region requests always.
+- **Paging:** burn-rate alerts on tile and directions SLOs and on speed freshness. ETA accuracy drift is a daily ticket, not a page.
+
+### Performance and cost
+
+- **Bottleneck:** routing CPU at a ~10k/s peak. CH keeps queries around a millisecond, so the real tuning is memory layout (cache-friendly graph arrays), caching popular origin–destination pairs at coarse precision, and computing alternatives only on request.
+- **CDN egress (largest cost):** 10B tiles/day × ~20 KB ≈ 200 TB/day. Levers: long cache lifetimes with versioned URLs, client caches, aggressive compression of vector tiles, and dropping detail at low zooms. The trade-off is staleness after map edits, handled by version bumps.
+- **Router memory:** every replica holds its region's graph in RAM, so replica count multiplies RAM cost; scale replicas per region with its local peak.
+- **Probe pipeline:** at 1M events/s and roughly 40 bytes each, that is ~40 MB/s, or ~3.5 TB/day into Kafka before replication. Batching on the device (already every ~30 s) cuts request overhead; sampling probes on well-covered highways cuts volume further, at the cost of slower jam detection on those roads.
+- **Storage is small:** 7 TB of tiles per version; keep a few versions and expire the rest.
+
 ## Follow-up questions
 
 ### How do you update the map when a new road opens?

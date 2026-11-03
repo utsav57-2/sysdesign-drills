@@ -215,6 +215,68 @@ Worked example: Ana follows 300 regular users and 3 celebrities. A regular frien
 
 Other users may briefly see 10,000 instead of 12,500, which is acceptable. The liker sees their own like immediately because the app updates its local state optimistically and `likedByMe` comes from the like row.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Users and the follow graph: sharded Postgres.** Usernames must be unique, account changes need transactions, and the `following`/`followers` pair should be written together. Volume is moderate and relational constraints catch bugs that would otherwise corrupt the graph. (Keeping both directions in step across shards needs an outbox or retried async write; a brief mismatch is tolerable.)
+- **Posts, likes, comments: Cassandra-style wide-column (or sharded Postgres).** Access is always "by partition key, newest first", writes are heavy (58k likes/s), and we need multi-region writes with tunable consistency. We give up joins and cross-row transactions, which these access patterns don't need; the `(post_id, user_id)` primary key handles dedupe.
+- **Feed lists and counters: Redis.** Pure derived data, rebuildable from posts and the graph, so BASE is fine.
+- **Media: object storage.** 150 TB/day of immutable bytes.
+- **ACID vs BASE:** ACID where uniqueness or money-like correctness matters (username, account state, post creation with its idempotency key). BASE for feeds, like counts and comment counts, as the requirements say.
+- **CAP stance:** the read paths (feed, media, counts) are **AP**: a slightly stale feed beats an error for 500M daily users. Post creation is **CP within the user's home region**: if the post write can't be durably stored, return an error so the app keeps the post locally and retries, rather than claim "posted" and lose it.
+
+### Service boundaries and communication
+
+- **Media**, **Post**, **Feed**, **Social graph**, **Likes and comments**, plus **media workers** and **fan-out workers**. Splits follow load shape: media processing is CPU/GPU heavy and bursty; the feed service is read-heavy and latency-critical; fan-out is write amplification that must never slow the feed read.
+- **Synchronous:** upload slot, `POST /posts` (returns 202), feed read and hydration, like/comment writes, follow/unfollow.
+- **Asynchronous:** object-created → processing queue → variants → "media ready" → post published → fan-out; like events → counter aggregation; unfollow cleanup; deletes and CDN purges. Each step can lag or retry without the user waiting, and the 202 + `processing` status makes that explicit.
+- **Hydration fan-in** is where sync calls multiply (posts, users, counts, `likedByMe`); use cache multi-gets under one deadline, not serial calls per post.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Media workers fall behind (viral event, transcoding spike) | Posts stay `processing` longer | Queue buffers the burst; autoscale photo and video pools separately (bulkheads) so videos can't starve photos; prioritize photos |
+| A file crashes the decoder repeatedly | Message redelivered forever, wasting workers | Max delivery attempts, then dead-letter queue; post marked `failed` and app offers retry |
+| Redis feed shard lost | Users on it get empty feeds | Graceful degradation: rebuild that user's feed by fan-out-on-read on demand; replicas for fast failover |
+| Counter or comments service slow during feed hydration | Feed p99 blows past 200 ms | Per-dependency timeouts within a feed deadline; on timeout return the page without counts (or cached counts); circuit breaker on the slow dependency |
+| Celebrity post triggers a burst of likes and comments | Hot partition and hot counter key | Sharded counters (already covered), rate limits per user, comment writes queued and shed when the partition is overloaded |
+
+### High availability and disaster recovery
+
+- **SPOFs:** none should be a single box. Postgres shards have synchronous standbys across zones; Cassandra runs replication factor 3 per region; Kafka is replicated across zones; Redis has replicas, and is rebuildable anyway.
+- **Zone vs region:** multi-region active-active for reads (users are global and reads are 100:1), with writes going to a user's home region and replicating asynchronously (see follow-ups). Cassandra's multi-datacenter replication fits this; Postgres user data uses a primary region plus cross-region replicas.
+- **RPO/RTO:** acknowledged posts and media **RPO 0 within a region** (the requirement "an upload reported as posted is never lost"), **≤ 1 minute** across regions. Likes and counters can tolerate **minutes** of loss because they can be recounted from like rows. **RTO:** feed reads **≤ 1 minute** (DNS/anycast to another region), posting **≤ 15 minutes** for a home-region loss.
+- **Backups:** delete protection or versioning on originals (a buggy deletion job is a bigger risk than hardware), plus Postgres and Cassandra snapshots. Feeds and counters are rebuilt, not backed up.
+
+### Security
+
+- **Authn:** OAuth tokens per device; session revocation on password change. **Authz:** private accounts enforced server-side on every post, feed and media URL (signed, short-lived URLs for private media, as in follow-ups).
+- **PII:** EXIF GPS is stripped in processing; emails and phone numbers encrypted at rest and visible only to the account owner and support with audit.
+- **Encryption and secrets:** TLS everywhere; storage and databases encrypted at rest with rotated KMS keys; the media service's signing credentials in a secret manager, rotated with overlap so in-flight presigned URLs stay valid.
+- **Audit log:** privacy setting changes, moderator and admin actions, and GDPR export and deletion requests.
+- **Abuse:** per-user and per-device rate limits on follows, likes, comments and posts; size and type limits on uploads; moderation before publish; phone verification for suspicious signups.
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of feed requests return in under 200 ms.
+  - 99.9% of posts become `ready` within 30 s for photos (longer target for video).
+  - Zero acknowledged posts lost, verified by reconciling post records against stored originals.
+  - CDN image availability 99.95%, with time-to-first-image under 1 s at p95 on mobile.
+- **Dashboards:** feed latency by region, CDN hit ratio, processing queue age, fan-out lag, counter flush lag.
+- **Traces:** feed reads with hydration fan-in (to find the slow dependency); upload → processing → publish → fan-out as one trace keyed by `post_id`.
+- **Paging:** burn rate on feed latency, post-ready latency and upload success. Queue depth alone is a dashboard signal unless it drives the post-ready SLO.
+
+### Performance and cost
+
+- **Bottleneck:** feed hydration at ~58k opens/s; batch multi-gets and cache hot posts.
+- **Media storage (largest growing cost):** ~55 PB/year, of which originals are ~2 MB of every 3 MB (~36.5 PB/year). Tier originals older than a few months to cold storage, since variants serve almost all reads; the trade-off is slow re-processing if a new format is needed. Cross-region copies of originals double that line, so keep a second copy only of originals in a cold class.
+- **CDN egress:** 580k images/s at an average of, say, 100 KB is ~58 GB/s, about 5 PB/day. WebP/AVIF and serving 640 px on slow networks are the biggest levers; better compression costs CPU at encode time.
+- **Fan-out writes:** with ~200 active followers per post on average, 50M posts/day is ~10B feed inserts/day (~116k/s). The celebrity threshold and skipping inactive users cap this; raising the threshold makes reads cheaper but writes costlier.
+- **Feed cache memory:** 500M users × 500 IDs × 8 bytes is ~2 TB of raw IDs, and several times that with Redis sorted-set overhead. Shorter lists for light users or not caching inactive users saves most of it, at the cost of on-demand rebuilds.
+
 ## Follow-up questions
 
 ### How do you generate post IDs?

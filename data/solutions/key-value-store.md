@@ -234,6 +234,66 @@ Example: a range split into 1,024 leaf buckets of ~100k keys each. If one key di
 - **Weak:** a B-tree updated in place. Random writes on every put.
 - **Best:** an **LSM tree**. Writes append to a commit log and go into a sorted memtable; full memtables flush to immutable SSTables; background compaction merges SSTables and drops overwritten values and expired tombstones. Reads check the memtable, then SSTables newest first, using a **bloom filter** per SSTable to skip files that definitely don't contain the key. Writes become sequential I/O, which suits a write-heavy, always-writable store.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Leaderless, AP data path.** Rejected: a leader-per-range design (Raft groups). It gives linearizable reads and multi-key transactions, but a range is unwritable for an election timeout whenever its leader dies, breaking "always writable". For carts, a rejected write costs revenue; a sibling the client merges costs a few lines of code. So the default is BASE: single-key atomic writes, eventual convergence via read repair, hints and Merkle repair.
+- **ACID is per key only.** A put is atomic and durable on W replicas (commit log first), but there are no multi-key transactions. Compare-and-set callers pay for a consensus round (lightweight transactions) and accept failure during partitions: CP for that call only.
+- **Control-plane metadata needs strong consistency.** Keyspace definitions, per-tenant quotas, ACLs and N/W/R defaults live in a small Raft-backed config store (three or five members). Two nodes disagreeing on a keyspace's replication factor would build different preference lists, so this must be CP. It's cached on every node, so an outage blocks admin changes, not traffic.
+
+### Service boundaries and communication
+
+- **One storage-node binary** runs coordinator, replica and gossip together. A separate coordinator tier would add a network hop to a 10 ms p99 budget for little gain.
+- **A separate control plane** (provisioning, repair scheduler, backup orchestrator, quota service) is split off because it needs different permissions and must never sit on the request path.
+- **Synchronous:** coordinator to replicas, waiting for exactly W (or R) acks. **Asynchronous:** the remaining replica acks, read repair (done after replying), hint replay, Merkle repair, compaction, backups and cross-region replication.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| One node dies | Its keys have 2 of 3 replicas; QUORUM still succeeds | Sloppy quorum + hinted handoff; replace the node within the 3-hour hint window or run repair |
+| Slow replica (GC pause, compaction storm) | p99 jumps because the coordinator waits on it | Per-replica timeout of a few ms, then **speculative retry** to the third replica; the phi-accrual detector marks it suspect so coordinators route around it |
+| Hot key | N nodes saturate while the rest idle | Detect with per-key counters; read cache, sub-key splitting, per-tenant load shedding with 429s |
+| Client retries a timed-out put | Same value written twice, possibly as two siblings | Puts are idempotent overwrites under the same context; reads collapse identical siblings. Clients use capped exponential backoff with jitter to avoid retry storms |
+| Repair falls behind `gc_grace_seconds` | Deleted data resurrects | Repair scheduler finishes a full cycle well inside the 10-day grace; flag any range whose last repair is older than ~7 days |
+| Disk fills (compaction can't keep up) | Writes fail on that node and neighbours absorb hints | Reject writes at a high-water mark (fail fast rather than corrupt), give compaction and foreground I/O separate bulkheads (thread pools, I/O budgets), add nodes |
+
+### High availability and disaster recovery
+
+- **No SPOF on the data path:** every node can coordinate, membership is gossiped, and the preference list puts the three replicas in three different availability zones. Losing an AZ removes one replica per key, so QUORUM reads and writes continue with **RTO ≈ 0** and no failover step.
+- **RPO in-region:** a W = 2 write sits in two AZs' commit logs before the ack, so RPO is 0 for acknowledged QUORUM writes. W = 1 callers explicitly accept losing a write if that one disk dies before replication.
+- **Region loss:** each region runs its own ring with LOCAL_QUORUM, replicating asynchronously. RPO is the replication lag (target under ~5 s); RTO is the time to point clients at the other region, a few minutes via DNS or SDK config.
+- **Backups protect against bugs and bad deletes, which replication copies faithfully.** Immutable SSTables make snapshots cheap (hard links, upload only new files); archived commit logs give point-in-time restore. Restore is parallel: each of 150 nodes pulls its ~2 TB, about 70 minutes at ~500 MB/s. Test the restore quarterly.
+
+### Security
+
+- **mTLS everywhere:** client to node, and node to node for gossip, replication, hints and streaming, so a rogue host can't join the ring. Certificates are short-lived and auto-rotated.
+- **Authn/authz per keyspace:** callers authenticate with a service identity; ACLs grant read/write/admin per keyspace. Each tenant gets its own keyspace plus ops/s and storage quotas, so one tenant's hot key can't starve others.
+- **Encryption at rest:** commit logs, SSTables, hint files and backups are encrypted with per-keyspace data keys wrapped by a KMS master key. Rotating the master key re-wraps data keys only; a new data key applies to new SSTables, and compaction rewrites old ones.
+- **PII and deletion:** values are opaque, so the store can't classify PII, but a GDPR delete isn't physically complete until compaction purges the tombstone after `gc_grace_seconds` and backups containing the key expire.
+- **Audit:** log every admin action (keyspace change, grant, decommission, restore). Per-request audit is opt-in per keyspace; at 1.2M ops/s it would cost more than the data.
+- **Abuse:** enforce the 1 MB value cap and a key-length limit at the coordinator; return 429 for quota breaches so clients back off instead of retrying blindly.
+
+### Observability
+
+**SLIs and SLOs (30-day windows):**
+- 99.99% of QUORUM writes succeed.
+- 99% of single-key reads and writes complete within 10 ms in-region.
+- 99.9% of cross-region replication completes within 5 s.
+
+**Dashboards:** per-node p99 latency, pending compactions and SSTables touched per read (read amplification), bloom filter false-positive rate, hints outstanding, oldest repair per range, disk usage and per-tenant throttles. **Tracing:** sample coordinator requests with a span per replica so one slow replica stands out. **Paging:** multi-window burn-rate alerts on the availability and latency SLOs (e.g. 2% of the monthly budget gone in an hour). Repair age and disk at 80% are tickets, not pages.
+
+### Performance and cost
+
+**Bottleneck: read amplification.** Reads are 2M of the 2.6M replica ops/s. Leveled compaction keeps SSTables per read low (at the cost of more write I/O than size-tiered); bloom filters at ~1% false positives and a block cache keep most lookups off disk; LZ4 block compression trades a little CPU for less I/O. Commit-log group commit batches fsyncs; token-aware clients with pooled connections skip the coordinator hop.
+
+**Cost drivers:**
+- **Storage, 300 TB raw over ~150 nodes**, plus compaction headroom. If values compress 2×, the fleet could shrink toward ~75 nodes, but per-node load doubles to ~35k ops/s (2.6M / 75), so check CPU and IOPS first.
+- **Replication factor.** N = 3 is the price of surviving an AZ loss with QUORUM. Dropping cache-like keyspaces to N = 2 saves a third of their storage, but then any single failure blocks QUORUM.
+- **Cross-region egress.** 200k writes/s × ~1 KB ≈ 200 MB/s, about 17 TB/day per remote region; at a couple of cents per GB that's several hundred dollars a day. Compress the replication stream and replicate only keyspaces that need multi-region.
+- **Operational complexity.** Repair, compaction tuning and node replacement need a dedicated team; a managed service trades that for higher unit cost and less control.
+
 ## Follow-up questions
 
 ### Why does R + W > N give strong reads, and when does it not?

@@ -135,6 +135,60 @@ Raw all-time counts would keep last year's news at the top forever. A common cho
 - Blocklists and classifiers remove offensive, sexual and violent suggestions, plus names in sensitive contexts. Run this offline during the build, and keep an emergency "kill list" that servers apply at runtime for instant removals.
 - Require a minimum query count and number of distinct users before a phrase can be suggested, which prevents both manipulation and leaking private queries.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **There is no database on the online path.** The suggestion service serves an immutable, in-memory prefix index loaded from a versioned snapshot in object storage. A relational DB was rejected for the reasons in the data-structure deep dive (`LIKE 'new y%'` at 600k/s), and a remote key-value store (Redis) adds a network hop to a 10–20 ms budget for no benefit, since the data only changes at snapshot time.
+- **Object storage for snapshots:** cheap, durable, and naturally versioned, which is what makes the blue/green swap and rollback work. Nothing needs to be queried there, only loaded whole.
+- **Kafka for query logs:** an append-only, replayable log fits ~1 TB/day of events that two consumers (Spark batch, Flink trending) read at their own pace. If the aggregation job has a bug, you fix it and replay.
+- **ACID is not needed anywhere in this system.** Losing or double-counting a few log events changes a decayed score by a rounding error. BASE everywhere is the right call.
+- **CAP stance: AP on every path.** During a partition, a replica serving an hour-old snapshot is far better than an error; the requirements say stale is fine. The one thing that must propagate quickly is the runtime **kill list**: treat it as a small, separately pushed config that servers poll every few seconds, so removing an offensive suggestion doesn't wait for the next build.
+
+### Service boundaries and communication
+
+- **Online:** CDN → load balancer → suggestion service. That's it. Keep it a single, dumb, read-only service; splitting ranking or filtering into separate services would add hops to a per-keystroke call.
+- **Offline:** search service → Kafka → aggregation → index builder → object storage. These are separate because they scale on different axes (batch compute vs. memory-bound serving) and fail independently: if Spark is down for a day, users still get yesterday's suggestions.
+- **Synchronous:** only the `GET /suggestions` request. **Asynchronous:** everything else. The search service fires query logs at Kafka and never waits on the suggestion system, and servers pull new snapshots rather than having the builder push to them.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| A suggestion shard's replicas are all overloaded or down | Prefixes in that range return nothing | Short client timeout (~150 ms) and render no dropdown, which is acceptable; load shedding at the LB before replicas tip over; over-provision hot shards ("s", "c") |
+| Bad snapshot (corrupt, empty, or offensive results) | Wrong or harmful suggestions everywhere | Validate before swap (size, phrase count within ±10% of last build, canary prefixes); canary to a few servers first; one-command rollback to the previous version |
+| Spark aggregation fails or is late | Rankings go stale | Keep serving the last good snapshot; alert on snapshot age, not job failure; Flink overlay keeps trending terms fresh |
+| Kafka consumer lag during a traffic spike | Trending overlay lags reality | Producers fire-and-forget with bounded local buffers so search is never slowed; lag is tolerable by design |
+| CDN edge outage or purge | Origin load jumps from the miss fraction to near 100% | Size origin for at least 2× the normal miss load; per-PoP rate limits; browser cache and debounce absorb some of it |
+| Thundering herd when a new snapshot loads | Many servers download tens of GB at once and GC/pause | Staggered rollout with jitter; servers report healthy only after load (as in the restart follow-up) |
+
+### High availability and disaster recovery
+
+- **SPOFs:** none on the online path once each shard has 3+ replicas across zones. The shard map in config is a quiet SPOF: version it and keep a last-known-good copy on each server.
+- **Multi-region:** deploy the suggestion service in every region where users are, active-active, mainly for latency (the 100 ms end-to-end budget doesn't survive a cross-ocean round trip). DNS or anycast steers traffic away from a failed region.
+- **Backups:** keep the last ~7 days of snapshots in object storage (cross-region replicated) and the aggregated phrase scores. Raw logs can be rebuilt from Kafka retention only for a few days, which is fine.
+- **RPO/RTO:** online RTO under 1 minute (traffic shifts to other replicas/regions). Ranking RPO is effectively "last good snapshot", hours at worst; nobody is harmed by suggestions an hour old. Kill-list RPO should be near zero because it's a safety control.
+
+### Security
+
+- **Authn/authz:** the endpoint is public and unauthenticated by design (it's cacheable with `Cache-Control: public`). Internal writes (snapshot upload, kill list edits) require service identities with least privilege; kill-list changes need named-human authz and are audit-logged.
+- **PII:** query logs contain what people type, including names, addresses and medical terms. Strip user IDs and IPs before aggregation, enforce the minimum-distinct-users threshold, and set short retention on raw logs. Encrypt logs and snapshots at rest; TLS from browser to CDN and CDN to origin.
+- **Abuse:** the main attack is manipulation, bots searching a phrase to push it into suggestions. Count distinct users, not raw searches, discount traffic flagged by bot detection, and rate-limit per IP at the edge. Secrets (storage credentials) live in a secrets manager and rotate automatically.
+
+### Observability
+
+- **SLIs/SLOs:** 99.9% of origin suggestion requests served within 20 ms, and 99% end-to-end within 100 ms (measured client-side), over 30 days. Availability: 99.95% of requests return 200. Freshness: the served snapshot is under 3 hours old 99% of the time.
+- **Dashboards:** CDN hit rate by prefix length, origin QPS per shard, p50/p99 latency, snapshot version and age per server (mixed versions mean a stuck rollout), Kafka consumer lag, and product metrics like suggestion CTR.
+- **Tracing:** sample origin requests; track pipeline lineage (which log window built which snapshot).
+- **Paging:** fast error-budget burn on latency or availability, and snapshot age over threshold. A single Spark retry failing is a ticket, not a page.
+
+### Performance and cost
+
+- **Bottleneck:** the 600k/s (1M+ peak) request rate. The CDN is the main tuning knob: 1–3 character prefixes are shared by everyone. At an 80% edge hit rate, origin sees ~120k/s on average and ~200k/s at peak; if each server does ~50k lookups/s, that's only ~4 servers' worth of CPU, so replica count is set by availability and memory, not compute. Raising TTL past 60 s increases hit rate but delays trending terms; the trade-off is freshness.
+- **Memory:** tens of GB of index per full copy, multiplied by replicas and regions. Storing phrase IDs instead of strings, a radix trie and capping depth (follow-ups) cut it; the cost is a slightly more complex build.
+- **Log storage:** ~1 TB/day of raw query logs is ~365 TB/year if kept. Keep raw logs ~30 days (~30 TB) and only aggregated phrase scores long-term; this is also the privacy-friendly choice. The trade-off is you can't re-run a new ranking model over old raw data.
+- **Cross-region egress:** shipping a full tens-of-GB snapshot hourly to every region adds up (30 GB × 3 regions × 24 ≈ 2 TB/day). Ship deltas, or build per locale only where it's served. Simpler still: full snapshots daily, and let the small Flink overlay carry hourly freshness.
+
 ## Follow-up questions
 
 ### How would you personalize suggestions?

@@ -225,6 +225,60 @@ Adding servers doesn't help when 5M people compete for 10,000 units; you need to
 - A reservation holds the unit for 10 minutes. The expiry worker finds rows with `status = 'reserved' AND expires_at < now()`, marks them `expired` with a conditional update (so a payment that just succeeded wins), decrements `sold` in the DB, and `INCR`s a Redis shard and removes the user from the buyers set.
 - Payment uses the reservation ID as the idempotency key with the provider; webhooks are deduped on the provider's event ID.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres for sales, reservations and inventory (ACID).** The final guard (`sold < total` plus `UNIQUE (sale_id, user_id)` in one transaction) is what makes "no oversell" true under any failure. Only ~10,000 winners reach it at ~170 writes/s, so a single primary is plenty; a NoSQL store would give up the cross-row transaction and the `CHECK` constraint for scale we don't need.
+- **Redis for stock shards, buyers sets and the queue.** It is the fast gate, not the record. A Lua script gives atomicity on one node, but replication is asynchronous, so Redis alone is not durable enough (see deep dive). This split is deliberate: BASE-ish speed up front, ACID truth behind it.
+- **CAP stance:** the purchase decision is **CP**. If Redis or the DB can't confirm a unit, the answer is "try again" or "sold out", never an unconfirmed "you got one". Over-rejecting a few buyers is a support issue; overselling is a legal and trust issue. The sale page, countdown and sold-out flag are **AP**: a stale "upcoming" page from the CDN is fine because the server decides when the sale opens.
+
+### Service boundaries and communication
+
+- **Waiting room**, **Purchase service**, **Order service**, **Expiry worker**, plus the CDN/edge. They are split by load: the waiting room absorbs millions of joins and status polls, the purchase service sees only ~20k/s admitted traffic, and the order service sees ~170/s. Different capacity, different autoscaling, different blast radius.
+- **Isolation from the main store** (a requirement) is the most important boundary: separate deployments, Redis cluster, DB connection pools and edge rate limits, so a sale meltdown can't take down normal checkout.
+- **Synchronous:** queue join and status polls (cheap Redis ops), purchase → Redis Lua → Kafka append → 201. The buyer must know the outcome within a second or two, and returning 201 only after Kafka acknowledges means a winner can't be lost between Redis and the DB.
+- **Asynchronous:** Kafka → order service → Postgres; payment webhooks; expiry → return to stock; sold-out broadcast. Async is what turns 20k purchases/s into ~170 steady DB writes/s.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Kafka append fails after Redis decrement | Unit taken in Redis but no durable event | Retry the append briefly with backoff; if it still fails, run a compensating Lua script (`INCR` stock, `SREM` buyer) and return "try again"; a periodic reconciler compares Redis stock with DB counts |
+| Redis stock shard fails over mid-sale | New primary misses recent decrements, could over-admit | DB guard rejects extras (see follow-ups); pause admission for that shard, reload from DB, resume |
+| Payment provider degraded | Winners can't pay within 10 minutes | Timeouts and idempotent retries with backoff + jitter; circuit breaker shows "payment delayed"; extend `expires_at` for reservations whose payment attempts failed on our side |
+| Traffic beyond 1M req/s or bot flood | Edge or waiting room overloaded | Load shedding at the edge (static "high demand, you're still in line" page), per-IP and per-device token buckets, waiting room join rate capped |
+| Poison event (unknown sale, bad payload) | Order consumer retries forever, blocking a partition | Bounded retries, then a dead-letter topic with an alert and a manual replay tool |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the single stock key (removed by sharding stock across 10 keys on separate nodes), the Redis primaries (replica per shard in another zone), the Postgres primary (synchronous standby in another zone), the queue controller (leader-elected pair; a standby takes over the drain loop).
+- **Zone, not region, for the live sale:** a flash sale runs for minutes. Run it in one region across three zones; an active-active multi-region stock counter would need cross-region coordination on every decrement, which kills latency and risks oversell. If the region fails, **pause the sale** and resume or reschedule; that is a business decision, not something to automate.
+- **RPO/RTO:** reservations **RPO 0** once the buyer sees 201 (Kafka `acks=all` to in-sync replicas in different zones, then Postgres with a synchronous standby). Redis stock **RPO ~seconds** is acceptable because it is reloaded from the DB. **RTO ≤ 1 minute** for a zone failure; for a region loss the sale is paused (RTO is hours, by choice). Postgres keeps normal point-in-time backups; the drill that matters is the pre-sale rehearsal.
+
+### Security
+
+- **Authn:** login required to join the queue; account age and verified phone or payment method as eligibility.
+- **Authz:** the signed purchase token binds `user`, `sale` and a 2-minute expiry; the purchase service checks the token's user matches the auth token's user, so tokens can't be resold or shared.
+- **Secrets and key rotation:** the HMAC/JWT signing key lives in a secret manager. Rotate it before each sale and keep the previous key valid for the token lifetime; edge and purchase service both need the verification key, so distribute it ahead of the start.
+- **Abuse is the main threat:** the bot defenses are in the deep dive. Add an audit log of every admission and purchase decision with device and IP, so fraudulent wins can be cancelled after the sale, and of sale configuration changes (stock, price, start time) with approver, since a typo there is costly.
+
+### Observability
+
+- **SLIs/SLOs (per sale, not 30 days, because a sale lasts minutes):**
+  - Zero oversold units (DB `sold <= total` and Redis vs DB reconciliation after the sale).
+  - 99% of purchase requests from admitted users answered within 1 s.
+  - 99% of queue status polls answered within 500 ms, and sold-out shown to all queued users within 10 s of stock hitting zero.
+  - 99.9% of winners have a reservation row in Postgres within 30 s of their 201.
+- **Live sale dashboard:** queue length and admit rate, purchase outcomes (201/409/410/429/403), Redis stock per shard, Kafka lag, edge rejections by reason, payment success.
+- **Paging:** because the window is minutes, page on fast symptoms: purchase error rate above a threshold for 30 s, Kafka lag growing, or any reconciliation mismatch. A war-room on-call watches the dashboard live during the sale.
+
+### Performance and cost
+
+- **Bottleneck:** the stock decrement. Sharding stock across 10 keys at ~2k scripts/s each and admitting 20k/s keeps each Redis node far below its limit. In-process sold-out flags and edge signature checks stop most of the 1M req/s before any network hop.
+- **Cost is spiky:** the waiting room lets the purchase tier be sized for 20k req/s, not 1M. Pre-scale before the sale (autoscaling reacts too slowly for a 5-second burst) and scale down right after.
+- **CDN:** ~2.5 TB of page assets for 5M users is the largest bandwidth line; trimming the sale page (fewer images, compressed assets) cuts it proportionally, at some cost to how the page looks.
+
 ## Follow-up questions
 
 ### Why not just use the database with row locking?

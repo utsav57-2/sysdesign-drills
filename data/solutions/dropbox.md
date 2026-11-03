@@ -147,6 +147,65 @@ Chunks are stored under their own hash (`chunks/ab/3f9c…`). That gives three p
 - **Garbage collection:** decrement chunk `ref_count` when versions expire; delete unreferenced chunks after a grace period.
 - Encrypt at rest (per-chunk keys wrapped by a KMS) and in transit; presigned URLs are short-lived and scoped to one object, and permission checks happen before they're issued.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Metadata DB (files, versions, chunk refs, shares, change log): sharded relational (MySQL/Postgres-style).** A commit must atomically check `latest_version == base_version`, insert the FileVersion, bump `ref_count` on its chunks and append to the change log. That is a multi-row ACID transaction, and sharding by namespace keeps it on one shard. A wide-column KV store was rejected: it would force us to build conditional multi-row writes and a monotonic cursor ourselves, and getting those wrong means lost edits or a skipped change on some device.
+- **Object storage for chunk bytes.** Immutable, content-addressed blobs need no transactions; they need cheap, durable capacity at 10 EB. A database would be absurdly expensive for this.
+- **CP vs AP per path.** Commits, sharing changes and the change log are **CP**: if a namespace's primary is unreachable, reject the commit and let the client retry rather than accept a write that could fork history. Reads of chunks are effectively AP and trivially safe because content never changes. Notifications are BASE by design: a lost hint only delays sync. Chunk `ref_count` decrements and garbage collection are eventually consistent, which is why deletion waits out a grace period.
+
+### Service boundaries and communication
+
+- **File service** (metadata, upload sessions, commits, ACL checks), **Notification service** (holds millions of long-lived WebSockets), plus background **GC/tiering workers** and **sharing**. Notification is split out because its scaling unit is open connections, not requests per second, and a deploy that drops connections must not touch commits.
+- **Synchronous:** upload-session, commit, `GET /changes` and share checks. The client needs the answer to proceed, and the commit must be durable before we say "saved".
+- **Asynchronous:** commit → change log → Notification service; object-storage upload events → File service; version expiry → GC; tiering. None of these sit on the user's critical path, and they can lag without breaking correctness because the change log is the source of truth.
+- Bytes go client ↔ object storage/CDN directly, so no service is a bandwidth hop.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Metadata shard primary dies | Commits for its namespaces fail | Automatic failover to a synchronous replica in another zone; clients retry commit with exponential backoff + jitter; commit is idempotent on `(session_id)` |
+| Object storage slow or erroring in one region | Chunk PUTs time out | Per-chunk timeouts and independent retries; resumable session means no progress is lost; client caps parallel uploads |
+| Notification service down | Devices stop hearing about changes | Graceful degradation to polling `/changes` every 30–60 s (already in follow-ups) |
+| Reconnect storm after an outage (millions of clients) | `/changes` and session endpoints overloaded | Jittered reconnect delays, server-sent `retry-after`, load shedding that favours commits over background sync |
+| GC bug deletes a chunk still referenced | Permanent data loss | Grace period before deletion, soft-delete with a recovery window, and a mark-and-sweep audit that recomputes references before any physical delete |
+| Poison upload event (malformed object, unknown session) | Consumer stuck retrying | Bounded retries, then a dead-letter queue with alerting; the commit path re-verifies chunk existence anyway |
+
+### High availability and disaster recovery
+
+- **SPOFs:** metadata shard primaries and the change-log cursor. Each shard runs a primary with a synchronous standby in a second zone and async replicas in a third; the API gateway and stateless services run in at least three zones behind load balancers.
+- **Region strategy:** the durability target (11 nines) is met within a region by object storage spread across zones. Add **cross-region replication** of chunks and async replication of metadata for disaster recovery rather than active-active writes, because active-active commits would need cross-region conflict handling on every version.
+- **Targets:** metadata **RPO 0 within a region** (synchronous standby) and **RPO ≤ 1 minute across regions**; **RTO ≤ 15 minutes** for a regional failover. Uploads are resumable and clients keep local copies, so a short outage is annoying but losing a committed version is not acceptable.
+- **Backups:** snapshots plus continuous log archiving of metadata, with regular restore drills. Version history covers user mistakes and ransomware.
+
+### Security
+
+- **Authn:** OAuth tokens per device, revocable individually when a laptop is lost. **Authz:** the File service checks owner/Share ACLs before issuing any presigned URL; URLs are scoped to one object and expire in minutes.
+- **Tenant isolation:** every metadata query is keyed by namespace ID; dedupe only within an account or team (see follow-ups).
+- **Encryption:** TLS everywhere; per-chunk data keys wrapped by a KMS master key. Rotating the master key re-wraps data keys, not exabytes of data.
+- **Secrets:** presigned-URL signing keys and DB credentials live in a secret manager and rotate on a schedule, with two keys valid during rotation.
+- **Audit log:** shares, permission changes, downloads of shared files and admin access, written append-only and retained for enterprise compliance.
+- **Abuse:** per-user and per-device rate limits on sessions and shares, malware scanning of public share links, quota enforcement at session creation.
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of commits succeed (excluding conflicts, which are correct behaviour).
+  - 99% of changes visible on another online device within 10 s of commit (measured with synthetic canary devices).
+  - 99.95% of chunk downloads succeed, and zero chunks fail hash verification without being repaired.
+- **Dashboards:** commit latency and errors per shard, change-log lag, WebSocket count, dedupe ratio, GC backlog.
+- **Traces:** upload-session → chunk PUTs → commit → notification → remote `GET /changes`, tagged with namespace and device, to find where sync latency goes.
+- **Paging:** fast burn on the commit or sync-latency SLO (e.g. 2% of the monthly error budget in an hour). Hash-verification failures page immediately because they signal corruption. Replica lag or a single slow node is a ticket, not a page.
+
+### Performance and cost
+
+- **Bottleneck:** metadata, not bytes. 6k uploads/s are each a commit transaction plus change-log append; hot shared namespaces concentrate load. Tune with batched commits for many small files, connection pooling per shard, indexes on `(namespace_id, cursor)` for `/changes`, and splitting very large team namespaces.
+- **Storage (by far the largest cost):** ~10 EB logical. Plain 3× replication would be 30 EB raw; **erasure coding** (around 1.5× overhead) cuts that to ~15 EB, at the cost of more CPU and slower repair. Cross-region DR copies add another full copy, so reserve that for erasure-coded cold storage.
+- **Dedupe and tiering:** content addressing already avoids storing unchanged chunks; moving untouched chunks to archive classes trades cheaper bytes for slower first access. At this scale owning storage hardware can beat a public cloud's per-GB price, at the price of a large operations team.
+- **Egress:** downloads through the CDN are the second cost driver; immutable chunks cache well, and compression helps documents but not already-compressed media. Metadata (billions of files × ~1 KB, only terabytes) is cheap, so spend on its replicas freely.
+
 ## Follow-up questions
 
 ### How do you handle a 50 GB upload on a flaky mobile connection?

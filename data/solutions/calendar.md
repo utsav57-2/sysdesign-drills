@@ -210,6 +210,71 @@ Delivery is at least once (a worker can crash after sending but before marking s
 - Attendee calendars are updated asynchronously from the transactional outbox. An attendee may see a new invite a second late, but never a version that wasn't committed, and consumers ignore versions older than what they have.
 - **Free/busy** reads the instance cache of each requested user for the range, merges overlapping intervals per user, and returns the busy lists. For ranges beyond the materialized window, expand rules on the fly. Cache per (user, week) and invalidate on change events.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Events DB (Postgres, sharded by organizer): ACID, CP.** Saving an event writes the series, its exceptions, attendees and the outbox row together. Partial commits would show attendees versions that never existed. At ~580 writes/s, NoSQL write scale buys nothing and would cost the multi-row transactions and `If-Match` check. During a partition the organizer gets an error rather than creating a divergent version.
+- **Attendee index and instance cache: derived, BASE.** Keyed by `user_id`, range-read by `start_utc`, write-heavy from fan-out, rebuildable from the events DB. A wide-column store fits (partition by user, cluster by time); Postgres sharded by user also works at 640 GB. Either way it lags the source by seconds.
+- **Reminder store: durable, at-least-once.** Postgres rows are the source of truth; the Redis minute buckets from the deep dive are a staging area loaded shortly before each minute, so losing Redis loses no reminders.
+- **CAP per path:** writes and RSVPs are CP. Week views and free/busy are AP: a view a few seconds stale, or a free/busy answer that misses a just-booked meeting, is resolved by humans. Room booking (out of scope) would need CP, since a double-booked room is a hard conflict.
+
+### Service boundaries and communication
+
+- **Event service** owns the truth and handles ~580 writes/s. **View / free-busy service** handles ~11.6k reads/s on average and ~35k/s at peak, about 20× the write rate, so it scales separately and stays up during an events-shard failover.
+- **Fan-out, reminder planner and invite notifier** are independent Kafka consumers, so a slow email provider can't delay attendee calendars.
+- **Reminder workers** are their own fleet because their load is a spike at :25 and :55.
+- **Synchronous:** client writes, RSVPs, views and free/busy. **Asynchronous:** everything after the commit, through the outbox. Synchronous fan-out would make an all-company meeting's save wait on thousands of attendee shards.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Events shard primary fails | Organizers on that shard can't edit for ~30–60 s | Automated failover to the synchronous standby; views keep working from the instance cache and Redis (graceful degradation); clients retry writes with backoff and the same `Idempotency-Key` |
+| Push or email provider slow or down | Reminders queue up | Separate queues and worker pools per channel (bulkheads); timeouts, retries with backoff and jitter until the event starts, then drop (follow-ups); circuit breaker per provider |
+| Pathological RRULE (e.g. `FREQ=SECONDLY`, or a huge imported `.ics`) | Expansion burns CPU or crashes consumers | Validate rules on write, cap instances per expansion window; after N failed attempts a change goes to a dead-letter topic with an alert instead of blocking the partition |
+| Fan-out consumer lag | Attendees see invites late; organizer sees own change late | Alert on lag; autoscale consumers; the organizer's own view reads from the events shard for read-your-writes |
+| tzdata update for a large zone | Millions of instances must be regenerated at once | Throttled background job that regenerates the next 7 days first; it competes with live fan-out only through its own consumer quota |
+| Duplicate reminder after worker crash | User gets two pushes | Idempotency key `(reminder_id, occurrence)` at the notification service (deep dive) |
+
+### High availability and disaster recovery
+
+- **No SPOF:** every Postgres shard has a synchronous standby in a second AZ, Kafka replicates across three AZs, and all services are stateless across zones.
+- **RPO 0 for events and RSVPs in-region** via the synchronous standby, because "RSVPs are never lost" is a requirement.
+- **Region loss:** users are homed to a region by shard, with an async replica in another. **RPO under 1 minute, RTO about 15 minutes for writes.** Views can come back sooner, read-only from the replica. After failover, reminder workers replay buckets from the gap and send only those whose event hasn't started.
+- **Derived data is rebuildable but not cheaply.** Re-expanding 640 GB for 100M users takes hours, so the instance store is replicated too.
+- **Backups:** nightly snapshots plus WAL archiving for point-in-time recovery of the 10 TB events DB.
+
+### Security
+
+- **AuthN:** user sessions for first-party clients; OAuth with scopes for third-party apps and CalDAV clients, so a scheduling app can get free/busy-only access instead of full event details.
+- **AuthZ:** per-calendar ACLs (owner, delegate, see details, free/busy only), enforced in the view service. Private events appear to others as "busy" with no title. Only the organizer or delegates can change core fields.
+- **Tenant isolation for organizations:** a domain's admin policies limit external sharing, and free/busy for users outside the domain is off by default.
+- **Encryption:** TLS in transit, KMS-managed encryption at rest for events, attendee lists and backups. Titles are sensitive (interviews, medical appointments, deal names). Push and email credentials live in a secrets manager and are rotated.
+- **Audit:** sharing changes, delegate grants, domain-admin actions and support-staff access to calendars.
+- **Abuse:** calendar spam, where strangers send invites with phishing links that show up automatically. Auto-add only from known contacts, rate-limit invites per organizer per day, cap attendees per event, run a spam classifier on external invites.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99% of week-view requests served within 200 ms.
+- 99.9% of reminders handed to the push/email provider within 30 s of `fire_at`.
+- 99.9% of event changes visible on every attendee's calendar within 10 s.
+- 99.95% of event writes and RSVPs succeed.
+
+**Dashboards:** reminder lag (now minus oldest pending `fire_at`), bucket sizes for the next few minutes, outbox relay lag, Kafka consumer lag per group, expansion time per event, week-view cache hit rate, provider error rates, 412 conflict rate. **Tracing:** carry trace context in the outbox record and Kafka headers so one edit can be followed from POST through fan-out, planner and send. **Paging:** burn-rate alerts on reminder timeliness (fast windows, since a bad :55 is over in minutes), view latency and fan-out freshness.
+
+### Performance and cost
+
+**Bottleneck: the reminder spike**, ~35k/s around :25 and :55 against a 3.5k/s average. Pre-load buckets a minute ahead, batch sends to providers over pooled, multiplexed connections, and spread users' sends within their second. For views, the index on `(user_id, start_utc)` in the instance store makes a week a single range read.
+
+**Cost drivers:**
+- **Event storage:** 10 TB × primary, sync standby and cross-region replica = ~30 TB. Archiving series that ended years ago to cheaper storage cuts it, at the cost of slow access to old history.
+- **Redis week-view cache:** caching two weeks for all 100M DAU at ~5 KB each is ~1 TB of memory. Caching only the current week, or only for users who opened the app today, halves it or more; misses fall back to the instance store at higher latency.
+- **Notifications:** 300M reminders/day. Push is nearly free; email costs per message, so default to push and make email opt-in.
+- **Cross-region replication** is small: ~580 writes/s × ~2 KB ≈ 1.2 MB/s, about 100 GB/day.
+- **Operational complexity:** outbox, Kafka and four consumers are more moving parts than synchronous writes, the price of fast saves and isolated reminders.
+
 ## Follow-up questions
 
 ### How do you find a meeting time for 10 people?

@@ -26,10 +26,13 @@ func TestLoadRealData(t *testing.T) {
 		}
 		solved++
 		md, _ := b.Solution(q.ID)
-		for _, h := range []string{"## Requirements", "## Core entities", "## API", "## High-level design", "## Deep dives", "## Follow-up questions", "```mermaid"} {
+		for _, h := range []string{"## Requirements", "## Core entities", "## API", "## High-level design", "## Deep dives", "## Production readiness", "## Follow-up questions", "```mermaid"} {
 			if !strings.Contains(md, h) {
 				t.Errorf("solution %s missing %q", q.ID, h)
 			}
+		}
+		if p, f := strings.Index(md, "## Production readiness"), strings.Index(md, "## Follow-up questions"); p > f {
+			t.Errorf("solution %s: production readiness must come before follow-up questions", q.ID)
 		}
 		if _, followUps, ok := strings.Cut(md, "## Follow-up questions"); ok && strings.Count(followUps, "\n### ") < 6 {
 			t.Errorf("solution %s has fewer than 6 follow-up questions", q.ID)

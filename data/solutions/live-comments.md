@@ -199,6 +199,69 @@ Servers are placed at many points on a hash ring. A video hashes to a point; its
 - On reconnect, the server reads `Last-Event-ID` and sends comments newer than it from the cache, closing the gap.
 - Very hot partitions can be split by time bucket (`(video_id, minute)`) so one partition doesn't grow without bound.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Cassandra for comments.** The workload is append-only, ~17k writes/s, ~290 GB/day, always read as "latest N for one video". That maps directly onto a partition key (`video_id`) plus a time-ordered clustering key, and Cassandra's leaderless writes keep accepting comments when a node is down. Postgres was rejected: comments need no joins or multi-row transactions, and sharding a relational store to this write rate and storage growth costs more operational effort than it returns. DynamoDB or Bigtable would work for the same reasons.
+- **Postgres for live video metadata.** Small, relational, rarely written, and the `status` flag (live / ended) gates posting, so it should be strongly consistent. Cached heavily on the read path.
+- **ACID vs BASE:** almost nothing here needs ACID. Comments are BASE: write at `LOCAL_QUORUM` or even `LOCAL_ONE`, and accept that a reader may briefly miss the newest comment. The places that do want strong consistency are bans and moderation deletes (a banned user must stop posting everywhere quickly), which live with user data and are cached with short TTLs.
+- **CAP stance:** the comment path is firmly **AP**, matching the stated requirement that the stream must never stall. During a partition each side keeps posting and delivering; ordering is fixed up by time-ordered IDs on the client.
+
+### Service boundaries and communication
+
+- **Comment service** (write path: rate limits, spam filter, persist, publish) and **realtime servers** (hold connections, fan out) are separate because they scale on different axes: 17k writes/s vs 10M open connections. A deploy of the comment service must not drop millions of SSE connections.
+- **Moderation** is split into an inline cheap check (synchronous, a few ms) and an ML classifier (asynchronous, publishes delete events). Putting the ML model on the synchronous path would blow the 200 ms budget.
+- **Synchronous:** POST comment → Cassandra write → 201. The write is synchronous so the poster knows it was saved.
+- **Asynchronous:** publish to pub/sub, fan-out to sockets, cross-region relay, archiving. Fire-and-forget is acceptable because Cassandra is the record and clients resume via `Last-Event-ID`.
+- **Not split further:** sampling for hot videos lives in the realtime server or a per-video aggregator, not a separate service per step; another network hop adds latency for no isolation benefit.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Realtime server crashes | Up to ~100k viewers disconnect at once | `EventSource` reconnects with `Last-Event-ID`; clients add **jittered backoff** so the reconnect storm doesn't hit the group's other servers all at once |
+| Redis pub/sub shard down | Comments for videos on that shard stop arriving live | Replica promotion; meanwhile realtime servers detect silence on an active channel and poll the recent-comments cache, a **graceful degradation** to near-live |
+| Cassandra slow or a partition hot | POSTs time out | Tight **timeouts** (~100 ms) on the write; on timeout, still publish and retry the write asynchronously with backoff, with a **DLQ** for writes that keep failing. A comment visible live but missing from history is acceptable |
+| 1M-viewer join storm | Recent-history reads overload one partition | Serve history from the Redis list or a CDN snapshot; admission throttling at the load balancer (**load shedding**) |
+| Slow client socket | Fan-out loop blocks | Bounded per-connection buffer; drop oldest comments for that client only, a per-connection **bulkhead** |
+| Spam wave on one video | Readable stream ruined | Per-user and per-video rate limits, slow mode, sampling that favors trusted accounts |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the L7 load balancer (run several behind anycast or DNS), the hashing-ring config (stored replicated, cached on each balancer; if it can't be refreshed, keep the last good copy), Redis shards (replica each), Cassandra (RF 3 across three zones).
+- **Regions:** viewers are global and latency target is 200 ms within a region, so run active-active in several regions, each with its own realtime fleet and pub/sub, joined by the cross-region relay. Cassandra replicates asynchronously across regions; a comment written in one region appears in another's history shortly after.
+- **Targets:** live delivery **RTO under ~30 s** (time for clients to reconnect elsewhere). Comment history **RPO of seconds**: a few comments lost in a region failure is acceptable for chat, and the product says so. Snapshots of Cassandra feed replay and VOD; daily backups are enough because history is not critical data.
+
+### Security
+
+- **Authn:** posting requires a logged-in user; watching may allow anonymous viewers with a signed, short-lived stream token so connections can't be opened in bulk without limits.
+- **Authz:** the comment service checks bans, the video's mode (followers-only, slow mode) and whether the video is live. Creators and moderators can delete; each delete is written to an **audit log** with actor and reason, since moderation decisions get disputed.
+- **Encryption:** TLS on all client and internal traffic, including the Redis and Cassandra links; at-rest encryption on Cassandra. Secrets (DB and Redis credentials) come from a secrets manager and rotate without restarting realtime servers, since a restart drops ~100k connections.
+- **PII:** comments carry user IDs and free text that may contain personal data. Honor deletion requests by tombstoning in Cassandra and expiring cached copies.
+- **Abuse:** per-user posting limits (1 per 2 s), per-IP connection limits on the stream endpoint, link and duplicate-text filters for bot floods.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 99% of comments are delivered to connected viewers within 200 ms of the POST returning, within a region (measured by synthetic viewers on every server group).
+- 99.9% of comment POSTs succeed.
+- 99.9% of stream connection attempts succeed.
+
+**Metrics:** open connections per server, publish-to-socket latency, per-connection buffer drops, subscribed channels per server, Cassandra write latency per partition, sampled-vs-received ratio on hot videos.
+
+**Tracing:** sample traces across POST → Cassandra → publish → realtime server → socket write. Tracing every fan-out write is too expensive at 20M messages/s; tag by `video_id` and trace only a sample.
+
+**Paging:** on burn rate of the delivery-latency and POST-success SLOs, and a sudden drop in total open connections (a symptom of a mass disconnect), not on a single server's CPU.
+
+### Performance and cost
+
+- **Main bottleneck:** fan-out to sockets for hot videos, 20M messages/s for a 1M-viewer video. Sampling (1.7k → 20 comments/s) is the big lever; batching writes every 100–200 ms cuts syscalls, and compressing the SSE response (flushed per batch) shrinks repetitive JSON further, at some CPU cost per connection.
+- **Egress** is the biggest cost: 20M messages/s × ~200 B ≈ 4 GB/s (~32 Gbps) for the hottest video alone. Levers: sampling harder, shorter payloads (send user IDs and let the client cache names), compression. Trade-off: fewer comments shown and more client logic.
+- **Storage:** ~290 GB/day × RF 3 ≈ 870 GB/day, ~26 TB per month. Lever: TTL comments after ~30 days or move them to object storage for replay. Trade-off: old replays fetch history more slowly.
+- **Connections:** ~100 servers for 10M viewers. Lever: tune memory per connection (TLS buffers) to fit more per server. Trade-off: a crash disconnects more viewers at once.
+- **Cross-region relay** is cheap: each region receives each comment once, 17k/s × 200 B ≈ 3.4 MB/s.
+
 ## Follow-up questions
 
 ### What happens when a realtime server crashes?

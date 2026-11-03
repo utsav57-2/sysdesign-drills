@@ -256,6 +256,81 @@ Three events became one message; a slow client never builds an unbounded backlog
 - Reserve buying power atomically before forwarding: `UPDATE accounts SET buying_power = buying_power - :cost WHERE id = :acct AND buying_power >= :cost`. Zero rows updated means reject.
 - Fills and cancels release or convert the reservation. Exchanges add their own risk checks (price bands, fat-finger limits, kill switches) in the gateway, and market-wide circuit breakers halt symbols that move too fast.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **The matching core uses no database, only a replicated append-only log on local NVMe plus in-memory books.** A database transaction costs milliseconds (the deep dive's "better" option). A general-purpose broker like Kafka adds latency the microsecond budget can't absorb. The log is ~100 GB/day, trivial in size. What matters is replication latency to the backup.
+- **Broker accounts in Postgres (ACID, non-negotiable).** The conditional `UPDATE ... WHERE buying_power >= :cost` must be atomic, or two concurrent orders spend the same cash. Positions and cash movements belong in the same transactional store so they reconcile.
+- **Trades DB and clearing feed (relational, ACID)** are built from the output bus, keyed by `seq`/`trade_id` so re-delivery is idempotent; regulators and settlement need exact, queryable records, not speed.
+- **BASE is fine only for derived views:** retail quote caches, order-status read models in the app, and charts. A quote 200 ms old with a sequence number is acceptable. A wrong fill is not.
+- **CAP stance:** the core is firmly CP. If the sequencer can't replicate to its backup, the shard **halts** rather than acking unreplicated orders, because a lost ack or two engines matching after a split brain means double fills and legal liability. Retail market data is AP.
+
+### Service boundaries and communication
+
+- **The engine is split off from everything** (validation, risk, formatting, persistence) so the hot thread does only matching. Inside the exchange, sequencer → engine is a lock-free ring buffer in one process, not an RPC. A network hop there would cost more than matching does.
+- **Synchronous:** retail order → broker API → risk transaction → 202. The app needs an immediate accept or reject.
+- **Asynchronous:**
+  - Broker → exchange over a FIX session: sequenced messages, with no request/response coupling.
+  - Fills going back to positions, clearing and market data.
+  - The order outcome reaching the app on the stream. That's why the API returns 202.
+- **The engine never waits on a consumer.** A slow clearing system or WebSocket tier must not back-pressure matching.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Primary engine crashes | Matching stops for its shard | Hot-standby promotion (deep dive), with **fencing**: an epoch number in every output so a "zombie" old primary's messages are rejected downstream |
+| Sequencer can't reach its log backup | Can't durably accept orders | Halt the shard and reject new orders with a retriable status. Never ack unreplicated input |
+| Broker–exchange FIX session drops mid-order | Broker doesn't know if the order rested or filled | Reconnect and resend from the last sequence number (FIX built-in). Dedupe by client order ID; buying power stays reserved until the state is known; never blindly resubmit |
+| Accounts DB slow | Retail orders can't pass risk | Short timeout and a "try again" reject; circuit breaker on the risk service. **Fail closed**: never skip the risk check |
+| Meme-stock spike floods retail market data | Fan-out tier CPU and bandwidth saturate | Graceful degradation: widen conflation from 100 ms to 250–500 ms, shed L2 depth before L1, admission control on new sockets |
+| Runaway algorithm floods a session | Hot shard falls behind | Per-session message-rate throttles at the gateway, fat-finger price bands, and a member kill switch |
+
+### High availability and disaster recovery
+
+- **In the primary site:** the sequencer replicates synchronously to a backup on separate power and network, a hot-standby engine applies the same log, and gateways and publishers run in pairs. Acked orders have **RPO 0**; engine failover **RTO is seconds**, since a longer pause in market hours is a public incident.
+- **Disaster recovery site** in another metro, fed **asynchronously**. Synchronous replication over that distance adds milliseconds per order (see the follow-up). After a site loss the RPO is a sub-second window of events. On DR activation, the exchange halts trading, members reconcile open orders against the DR state using their execution reports, and trading restarts. The target RTO is in the order of an hour or two. US rules for critical market systems set a two-hour resumption goal, and the drills are designed around it.
+- **Broker:** Postgres with a synchronous standby (RPO 0) and point-in-time recovery from WAL archives.
+- **Backups:** the daily event log (100 GB) and snapshots go to write-once storage with multi-year retention. They are the legal record and allow exact replay.
+
+### Security
+
+- **Exchange authn:** member firms connect over private cross-connects or dedicated lines with per-session credentials and allowlisted endpoints. **Authz** is per session: which firm IDs, accounts and credit limits it may trade against. Inside colocation, latency budgets often push encryption down to physical isolation or the network layer. State that trade-off explicitly rather than pretending TLS is free.
+- **Broker authn:** short-lived OAuth tokens, MFA and device binding for login, new-device orders and withdrawals; takeover signals (new device plus a full withdrawal) trigger holds.
+- **Encryption at rest** with HSM-backed keys and scheduled rotation; SSNs and bank details get field-level encryption readable only by KYC and payments roles.
+- **Audit:** the sequenced log already reconstructs every order and trade. Add tamper-evident logs for operator actions: symbol halts, kill switches, risk-limit and price-band changes, and who approved them. US firms also report to the Consolidated Audit Trail.
+- **Abuse:** surveillance jobs over the log look for spoofing, layering and wash trades. Throttles and price bands sit at the gateway.
+
+### Observability
+
+- **SLIs and SLOs, measured over trading hours only:**
+  - 99.9% of colocated order acks within 1 ms at the gateway.
+  - 99% of retail orders acknowledged to the app within 100 ms.
+  - 99.9% of retail quote updates delivered within 300 ms of the trade (the 100 ms conflation window plus network).
+  - 99.99% availability of order entry per trading session.
+- **Correctness invariants are not SLOs; any violation pages instantly:**
+  - sequence gaps
+  - primary/standby book checksum mismatch (compare hashes every N events)
+  - a crossed book after matching
+- **Metrics:** per-stage microsecond latency histograms (gateway in, sequenced, matched, out), ring-buffer occupancy, backup and DR replication lag, message rate per symbol and session.
+- **Tracing:** normal distributed tracing is too expensive on the hot path. Instead, stamp `seq` and hardware timestamps at each hop and reconstruct latency out of band from network taps. The broker side uses ordinary tracing.
+- **Paging:** latency-SLO burn, any invariant violation, and DR lag above threshold.
+
+### Performance and cost
+
+**Bottleneck:** one thread per shard at ~500k msgs/s peak, concentrated in a few symbols. Beyond the deep dive's tuning:
+- The sequencer **group-commits**: it batches whatever arrived in the last few microseconds into one replication write, which raises throughput at a tiny latency cost.
+- Hot symbols are rebalanced onto their own shards before the open, based on the previous day's volume.
+
+**Retail fan-out:** sending one frame per client per flush, carrying all its changed symbols, caps the worst case at 10M × 10 frames/s = 100M frames/s instead of ~2B per-symbol updates/s.
+
+**Cost drivers:**
+- **Redundant low-latency hardware:** primary, hot standby and DR site, roughly 3× the compute, with dedicated cores, kernel-bypass NICs and colocation space. This is the price of RPO 0 and fast failover; cutting it is rarely acceptable.
+- **Retail fan-out bandwidth:** at ~200 bytes per frame, 100M frames/s is ~20 GB/s (160 Gbps) worst case. Using 500 ms conflation for backgrounded or mobile clients cuts their frames 5×, at the cost of visibly slower ticks.
+- **Storage is cheap:** 100 GB/day × ~252 trading days ≈ 25 TB/year, kept for years.
+- **Operational complexity:** a custom log and engine need a specialized team; the broker side, where milliseconds are fine, should stick to standard components.
+
 ## Follow-up questions
 
 ### How do you handle a cancel that races a fill?

@@ -202,8 +202,8 @@ docker run --rm --network=none --read-only --tmpfs /tmp:size=64m \
 ```
 loop:
     msg = queue.lease(["contest", "practice", "run"], visibility=60s)   # first non-empty
-    sub = db.get(msg.submission_id)
-    if sub.status is final: queue.ack(msg); continue                   # duplicate delivery
+    sub = msg.submission                     # id, code, language, problem; workers have no DB access
+    if results_api.is_final(sub.id): queue.ack(msg); continue          # duplicate delivery
     tests = cache.get_or_fetch(sub.problem_id, problem_version)
     box = pool.take(sub.language)                                        # pre-warmed
     verdict = box.compile(sub.code)
@@ -257,6 +257,69 @@ Every verdict for a contest submission updates the user's row in Postgres in a t
 4. **Shed less important work:** pause or throttle custom runs and practice judging during the first minutes of a contest.
 5. **Rate-limit per user:** one submission per few seconds, which also blunts brute-force guessing.
 6. **Static content at the CDN:** problem statements are published to the CDN at the start time, so 50k simultaneous page loads don't hit the origin.
+
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres for problems, submissions, contests and contest results.** This data is relational (submission → problem → contest), small (12 submission rows/s normally, ~1,000/s at peak), and needs transactions: a verdict must update the submission row and the user's contest result together, and the conditional final-status write (`WHERE status NOT IN final states`) relies on row-level atomicity. A NoSQL store would handle the write rate easily but would push the "exactly one final verdict" guarantee and the per-user penalty math into application code. Rejected.
+- **Object storage for code and test cases.** 5 GB/day of code blobs don't belong in the hot database; versioned test data is immutable and cached on workers, so eventual consistency on reads is fine as long as a worker always fetches a specific version, never "latest".
+- **Redis sorted sets for leaderboards: BASE, derived, rebuildable.** A rank that lags by a second is harmless; a lost point is not, which is why points live in Postgres and Redis is only a projection.
+- **CAP stance:** the submission path chooses **consistency**. If Postgres's primary is unreachable we reject new submissions with a retryable error rather than accept work we can't record. The leaderboard chooses **availability**: serve the last cached page with its `asOf` timestamp rather than an error.
+
+### Service boundaries and communication
+
+- **Problem service** (read-mostly, CDN-fronted), **submission service** (writes, rate limits, SSE), **leaderboard service** (Redis), and the **judge fleet**. The judge is split out because it has a completely different trust level (it runs hostile code), scaling curve (10 → 250 hosts) and hardware profile. Problem and submission services could share one deployable early on; the split that really matters is the judge.
+- **Synchronous:** reading problems, creating the submission row, reading leaderboard pages, all of which must answer the user now.
+- **Asynchronous:** submit → judge queue → Kafka verdict events → submission and leaderboard services. Judging takes seconds and peaks at 1,000/s, so a durable queue absorbs the spike and keeps API threads free. Workers report results only as verdict events, never by writing to the database, which narrows what a compromised worker can touch.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Worker host dies mid-judge | Submission stuck in `running` | 60 s lease expires, message redelivered; deterministic judging plus conditional status write makes the re-run idempotent |
+| A submission crashes the judge every time (poison message) | Endless redelivery wastes sandboxes | Count deliveries; after 3, move to a **DLQ** and mark the submission `system_error` so the user can resubmit; alert if DLQ rate rises |
+| Contest start exceeds capacity | Queue age grows past the 10 s target | Pre-warm, scale on queue age, **shed** custom runs and practice first; separate queues act as **bulkheads** so contest traffic is never starved |
+| Redis leaderboard node lost | Rankings unavailable | Serve cached top pages; rebuild the sorted set from Postgres contest results (50k rows takes seconds) |
+| Kafka verdict consumer lags | Verdicts delayed, SSE shows "running" | Clients fall back to polling the status endpoint; alert on consumer lag; consumers are idempotent on `submission_id` |
+| Object storage slow or erroring | Workers can't fetch code or tests | **Timeouts** with **retries using exponential backoff and jitter**; test cases already cached per host; a **circuit breaker** stops workers leasing new messages so they aren't burned on failures |
+
+### High availability and disaster recovery
+
+- **SPOFs:** Postgres primary (removed with a synchronous standby in another zone and automatic failover), the queue and Kafka (replicated across three zones), Redis (replica plus rebuild from Postgres). The judge fleet has no SPOF; it's stateless and spread across zones.
+- **Zone vs region:** multi-zone in one region. A contest is a fixed 90-minute window; cross-region active-active adds consistency problems for contest results without much benefit. Keep a warm standby region with replicated backups.
+- **Targets:** submissions and contest results **RPO ≈ 0** within the region (synchronous replica) and **RTO under 5 minutes**, because losing an accepted solve during a contest changes rankings. For a full region loss, RPO of minutes from async replication and RTO of an hour are acceptable: we'd extend or reschedule the contest. Code blobs and test cases rely on versioned, cross-region-replicated object storage.
+
+### Security
+
+The deep dive covers sandbox isolation; the rest of the system needs its own controls.
+
+- **Authn/authz:** OAuth or session tokens at the gateway; user ID always from the token. Admin roles (problem setters) are separate and required to read hidden test cases or trigger rejudges.
+- **Hidden test cases are the crown jewels:** encrypted at rest, readable only by the judge's service identity and problem setters, and every admin read is written to an **audit log**.
+- **Workers hold no long-lived secrets:** short-lived credentials scoped to "lease from queue, read this problem's tests, publish verdicts", rotated automatically.
+- **Encryption:** TLS everywhere including the internal queue; at-rest encryption for Postgres and object storage. User code may contain personal info, so it's private by default.
+- **Abuse:** per-user submission limits (one per 5 s), per-IP account creation limits to stop sock-puppet accounts, and CAPTCHA on suspicious bursts.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 95% of practice submissions reach a final verdict within 5 s; during contests, 95% within 10 s.
+- 99.9% of submissions reach a final verdict at all (not `system_error`).
+- 99.9% of leaderboard requests succeed with data less than 10 s old.
+
+**Dashboards:** queue depth and oldest-message age per class, warm sandbox pool size per language, verdict mix per problem (a sudden spike in WA on one problem usually means bad test data), host count vs autoscaler target, Kafka consumer lag.
+
+**Tracing:** one trace per submission across API → queue → worker → verdict event → SSE, with spans for compile and test runs, so a slow verdict can be pinned to queue wait vs execution.
+
+**Paging:** alert on SLO burn rate (verdict latency and system-error rate) and on contest queue age over 10 s. Don't page on a single host failure; leases handle that.
+
+### Performance and cost
+
+- **Main bottleneck:** sandbox capacity at contest peaks, 2,000 concurrent sandboxes. Levers: warm pools to cut startup, stop at the first failing test, cache test cases per host, and pin one core per sandbox so timing stays fair.
+- **Biggest cost: the judge fleet.** Running 250 hosts all day for a peak that lasts minutes would be wasteful; normal load needs ~10 hosts. Scaling up 15 minutes before a 90-minute contest means ~250 hosts for ~2 hours, roughly 500 host-hours per contest. Spot or preemptible instances are tempting for practice and custom runs (leases make interruptions safe), but contest workers should stay on-demand, single hardware type, for consistent timing.
+- **Storage** is minor: ~1.8 TB/year of code. Move submissions older than a year to cheaper storage tiers; the trade-off is slower "view old submission".
+- **Leaderboard reads** (5k/s) cost almost nothing from Redis with 2–5 s page caching; the trade-off is slightly stale top pages.
+- **Operational complexity:** gVisor or Firecracker adds operational work beyond plain containers; worth it here because the threat model is literally hostile code.
 
 ## Follow-up questions
 

@@ -223,6 +223,75 @@ Preferences are read on every notification, so they're cached in Redis with a sh
 - Templates are versioned per channel and locale (`order_shipped`, `email`, `de-DE`, v4). Workers cache them; a new version is rolled out by bumping the active version, and rendering failures (missing variable) fail fast to the DLQ.
 - Scheduled sends use the same design as a job scheduler: rows bucketed by send minute, pulled a minute early into the incoming topic. Campaigns at "9 AM local time" become 24+ batches, one per time zone.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Cassandra for the notification log.** About 500 GB/day of writes and status updates, read only by `user_id`, expiring after 30 days: wide-column with TTL fits this exactly. Postgres would need manual sharding for 11.6k inserts/s plus status updates, and 15 TB of history. Status is **BASE**: last-write-wins per attempt, and a status that lags a callback by seconds is harmless.
+- **Preferences and the suppression list** sit in a key-value store keyed by `user_id`, but they are the one place correctness is legal, not cosmetic. Opt-outs and STOP replies are written at quorum (or with a strongly consistent write) and acknowledged only once durable, and the cache entry is invalidated on write.
+- **Postgres for campaigns and templates.** Campaign state transitions (draft → scheduled → sending) must be transactional so a double-clicked "launch" can't start two 50M-user sends.
+- **Redis for dedup keys and frequency caps** (~100 GB). It's fast but not authoritative. The CAP choice when it's unavailable is per priority: **fail open** for OTPs and security alerts (a rare duplicate beats a missing login code) and **fail closed** (pause) for marketing, where blowing through frequency caps hurts users and sender reputation.
+
+### Service boundaries and communication
+
+- **API** (validate, dedup, enqueue), **scheduler**, **processor** (preferences, caps, rendering: CPU and cache bound) and **per-channel senders** (I/O bound and limited by providers) are separate services. They scale on different signals, and each sender pool is a bulkhead around one provider family.
+- **Callback ingestion** is its own pool writing receipts to Kafka, so a post-campaign bounce storm can't starve the send API.
+- **Don't make preferences a synchronous microservice.** The processor reads the store through a shared cache library; an extra hop per notification at 83k/s adds latency and a dependency for little gain.
+- **Sync vs async:** callers → API is synchronous only up to the Kafka ack (202). Everything else is async through topics, except the provider calls themselves, which are synchronous HTTP with strict timeouts (~2 s for push, longer for email), because a hung connection holds a sender slot.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| SMS/email provider outage | Sends fail or slow down | Circuit breaker, retry topics with backoff and jitter, failover to a second provider (deep dive) |
+| Redis unavailable | No dedup or frequency caps | Fail open for high priority, pause the low-priority consumers; local per-instance caps as a coarse fallback |
+| Preference store slow | Processor stalls, all channels lag | 50 ms read timeout; serve the cached value; on a miss, defer marketing and send only categories users can't opt out of (security alerts) |
+| Bad template version deployed | Every render fails, DLQ floods | Render-validate on publish; roll back the active version; replay the DLQ once fixed |
+| Campaign spike at 83k/s | Low-priority topics lag | Expected: separate topics and sender capacity keep OTP latency flat; provider token buckets meter the drain |
+| Region loss | Accepted-but-unsent messages stranded | Async mirror of Kafka topics; callers retry against the other region with the same idempotency key (see HA) |
+
+### High availability and disaster recovery
+
+- **SPOFs:** API, processor and senders are stateless across 3 zones; Kafka RF 3 with min ISR 2; Redis cluster with replicas; Cassandra RF 3 per region; Postgres with a standby; the scheduler uses leader election.
+- **Multi-region:** OTP and security alerts justify **active-active** API and sender tiers in two regions, since a login that can't get its code is an outage of the whole product. Marketing can run active-passive.
+- **Targets:**
+  - Transactional sends: **RTO under 5 minutes**. For region loss, **RPO is seconds** of mirror lag; idempotent caller retries close most of the gap, at the risk of an occasional duplicate (dedup keys are regional).
+  - Campaigns: **RTO of hours** is acceptable. Campaign progress (the last segment page published) is checkpointed in Postgres so a resume doesn't restart from user 1.
+  - Preferences and suppressions: **RPO near 0**, since losing an opt-out is a compliance breach. Use multi-region replication plus daily backups.
+- **Backups:** Cassandra snapshots, Postgres PITR, daily suppression-list exports to versioned object storage.
+
+### Security
+
+- **Callers:** services authenticate with mTLS identities. Authorization is per caller and category: only the auth service may send `security` or OTP categories, and only the campaign tool may send `marketing`. A compromised service can't phish with "security" messages.
+- **Users:** user tokens for preferences; unsubscribe tokens carry a key ID so signing keys can rotate.
+- **Providers:** API keys in a secrets manager, rotated by adding a second key before revoking the first. Callback signatures are verified before receipts are accepted.
+- **PII:** phone numbers, emails and rendered content. Never log rendered OTP text; store `params` encrypted or redacted in the log, and let the 30-day TTL bound retention. Encrypt volumes; TLS everywhere.
+- **Audit:** campaign launches (who sent what to how many), template changes, and preference changes with timestamps, as proof of consent and opt-out.
+- **Abuse:** SMS pumping controls (follow-up) and per-caller quotas, so one buggy service looping on an event can't send 10M messages.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.9% of high-priority notifications handed to a provider within 2 s of the 202.
+- 99.99% of accepted notifications reach a terminal state (sent, suppressed or permanently failed) within 24 h. Nothing stays stuck.
+- Zero sends to an opted-out channel more than 1 minute after the opt-out, checked by a canary user who opts out and back in hourly.
+
+**Dashboards:** lag per channel and priority, provider errors and breaker state, DLQ depth, dedup-skip rate, SMS spend per country per hour.
+
+**Tracing:** carry `notification_id` from caller to provider call; join callbacks by provider message ID.
+
+**Paging:** OTP latency burn rate, stuck-notification growth, and high-priority DLQ growth. Marketing lag or one breaker opening is a ticket.
+
+### Performance and cost
+
+**Bottleneck:** provider throughput limits, not our compute. Keep pooled long-lived connections (APNs uses HTTP/2, so many requests share one connection), use provider bulk endpoints where offered, render once per locale for campaigns, and keep the preference cache hit rate high so the store sees a fraction of 83k/s.
+
+**Cost drivers:**
+- **SMS dominates.** 5% of 1B is 50M SMS/day. At an assumed $0.005–0.01 per message (prices vary widely by country), that's $250k–500k/day, more than all infrastructure combined. Levers: push-first with SMS fallback (follow-up), app-based OTP where possible, cheaper routes per country (trading some deliverability), and pumping controls.
+- **Notification log.** 15 TB × RF 3 = 45 TB, more with a second region. Store status and template ID rather than rendered bodies, or shorten the TTL; support loses some history.
+- **Redis, ~100 GB of RAM** for dedup. Storing a 16-byte hash of the key instead of the full string shrinks it, with a negligible collision risk.
+- **Cross-region replication** of the log doubles storage and adds egress on ~500 GB/day; skip it unless support needs history after failover.
+
 ## Follow-up questions
 
 ### How do you guarantee an OTP is delivered fast during a huge campaign?

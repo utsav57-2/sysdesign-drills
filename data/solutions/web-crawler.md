@@ -153,6 +153,63 @@ Pages whose fingerprints differ in **≤ 3 bits** (Hamming distance) are treated
 - **Freshness:** re-crawl pages based on how often they changed historically (news homepages hourly, static docs monthly); use `If-Modified-Since` and ETags to save bandwidth.
 - **Traps:** cap URL length, path depth and pages per domain; detect repeating path patterns (calendar loops `/2026/11/2026/11/...`) and auto-generated infinite pages.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **URL table: DynamoDB/Cassandra.** Tens of billions of rows, random-access writes keyed by `url_hash`, no joins, and every access is a point lookup or upsert. A relational DB would need heavy manual sharding to take ~23k status updates/s plus link-discovery checks (several times that, since each page yields many links), and gives you nothing in return. A wide-column/KV store partitions on `url_hash` naturally.
+- **S3 for pages:** ~250 TB compressed of immutable blobs is exactly what object storage is for. Never put page bodies in the URL table.
+- **Frontier: a durable queue (Kafka or SQS),** not a database table. Polling a table for "next URL for a domain whose time has come" at 23k/s is a classic way to build a hot index.
+- **No ACID needed.** Everything is idempotent by `url_hash`: refetching a page overwrites the same S3 key; re-inserting a seen URL is a no-op. The cost of inconsistency is a duplicate fetch or a skipped URL, both cheap. That's why BASE is the right choice throughout.
+- **CAP: AP everywhere.** If a URL-table partition is unreachable, it's better to keep crawling and occasionally re-fetch a page than to stall 300 fetchers. The one thing to keep strongly consistent per domain is the rate limit, and the frontier design gets that by giving each domain a single owner, not by distributed consensus.
+
+### Service boundaries and communication
+
+- **Frontier, fetchers, parsers, dedupe** are split because they're bound by different resources: queue I/O, network, CPU, and memory (Bloom filter). The fetch/parse split is explained above.
+- **Robots and DNS caches** are libraries/sidecars inside fetchers, not remote services, because they're consulted on every fetch and a remote hop would add latency and a failure point.
+- **Everything is asynchronous.** There's no user waiting, so every hand-off is a queue: frontier → fetcher → parse queue → parser → dedupe → frontier. Queues absorb rate mismatches (e.g. parsers falling behind for an hour) and give you leases and retries for free. The only synchronous calls are the external HTTP fetch, DNS, and the dedupe lookup from parsers, which is synchronous because the parser needs the answer before enqueueing.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Target site slow or hanging | Fetcher connections tied up | Connect timeout ~5 s, read timeout ~30 s, 10 MB size cap; per-domain concurrency limit as a bulkhead so one slow site can't consume a fetcher's connection pool |
+| Site returning 5xx/429 | Wasted fetches, angry site owner | Per-domain exponential backoff with jitter and a circuit breaker (see follow-up); honor `Retry-After` |
+| Fetcher crashes mid-batch | Leased URLs not acked | Lease expiry (5 min) returns them to the frontier; idempotent S3 writes |
+| Poison page crashes the parser (malformed HTML, zip bomb) | Parse task retried forever | Attempt count; after N failures route to a DLQ; parse in a sandboxed process with memory/CPU limits |
+| DNS resolver overloaded | Fetch rate collapses globally | Local cache with long TTLs, dedicated resolver fleet, negative caching for NXDOMAIN |
+| Parsers fall behind | Parse queue grows, S3 raw grows unparsed | Autoscale parsers on queue lag; if still behind, pause low-priority domains in the frontier (load shedding at the source) |
+
+### High availability and disaster recovery
+
+- **This is a batch system, so "availability" means throughput and progress, not uptime.** Losing a zone should slow the crawl, not lose it.
+- **SPOFs:** the frontier (replicated Kafka/SQS across zones), the URL table (replication factor 3 across zones), and the Bloom filter (sharded in memory; rebuildable from the URL table, and snapshot it to S3 every hour so a restart doesn't need a full rebuild).
+- **Single region with multi-zone** is the default. Multi-region crawling is for latency to far-away sites (see follow-up), not for DR.
+- **Backups:** S3 is already durable; enable versioning or cross-region replication only for the extracted text and metadata that downstream training depends on. Raw HTML can be re-crawled.
+- **RPO/RTO:** frontier and URL table RPO of minutes is fine: re-crawling a few minutes of pages (~23k/s × 300 s ≈ 7M pages) costs well under 1% of a 10B crawl. RTO a few hours; a 5-day crawl that pauses for 2 hours finishes ~2% late.
+
+### Security
+
+- **We are the client, so security is about what we fetch.** Treat every page as hostile: parse in sandboxes, cap decompression ratios, never execute fetched JS outside the isolated rendering fleet.
+- **SSRF:** a discovered link like `http://169.254.169.254/` or an internal hostname must never be fetched. Block private IP ranges after DNS resolution (not just by hostname, to stop DNS-rebinding), and run fetchers in a network segment with no route to internal services.
+- **Authz:** fetchers can write to `raw/` but not delete; only the curation pipeline reads `text/`. Encrypt buckets at rest; TLS for internal traffic.
+- **PII and legal:** crawled pages contain personal data. PII scrubbing in the text pipeline, a takedown process that deletes by `url_hash` across raw, text and derived datasets, and an audit log of takedowns and dataset builds.
+- **Abuse by us:** the politeness rules are also our reputation. Publish IP ranges and a contact URL, and alert if any domain exceeds its rate limit.
+
+### Observability
+
+- **SLIs/SLOs:** sustained fetch rate ≥ 23k pages/s averaged per hour (otherwise the 5-day target slips); fewer than 0.1% of fetches violate a domain's crawl delay; 99% of fetched pages parsed and stored within 1 hour; frontier progress on track to finish 10B within 5 days.
+- **Dashboards:** pages/s, bytes/s, HTTP status mix, per-domain error rates, frontier depth per priority level, parse queue lag, DLQ size, Bloom filter fill ratio (false-positive rate rises as it fills), duplicate-content ratio.
+- **Tracing:** full traces aren't useful at 23k/s; instead keep a per-URL event log (`dequeued`, `fetched`, `parsed`, attempts) in the URL record, and sample traces for debugging.
+- **Paging:** projected completion time slipping past the deadline, politeness violations, and abuse complaints. A single fetcher dying is not a page.
+
+### Performance and cost
+
+- **Bottleneck:** per the follow-up, the frontier/URL-table metadata and DNS, not bandwidth. Batch URL-table writes and dedupe lookups (parsers check a page's 50–100 links in one batched call), keep the domain-owned frontier so lookups stay local, and reuse HTTP connections to the same host.
+- **Bandwidth:** 18 Gbps for 5 days ≈ 1 PB transferred. Ingress is often free or cheap in clouds, but NAT gateways and inter-zone hops can charge per GB, so route fetchers straight to the internet and keep S3 writes in-zone where possible. Conditional GETs on re-crawls avoid re-downloading unchanged pages.
+- **Storage:** ~250 TB compressed per crawl. Content-hash dedupe drops exact copies before storage; move raw HTML older than one crawl cycle to an archive tier. Trade-off: re-parsing old crawls gets slower and costs retrieval fees.
+- **Compute:** JS rendering at 10–100× cost per page is the biggest lever; render only pages that need it.
+
 ## Follow-up questions
 
 ### How do you crawl JavaScript-heavy sites?

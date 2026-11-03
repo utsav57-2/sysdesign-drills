@@ -238,6 +238,77 @@ ZRANK lb:seg:42 user:alice           # alice's 0-based rank, O(log N)
 
 Most users have under a few hundred followers, so **fan-out on write** works: on publish, push the activity ID into each follower's Redis list (`LPUSH` then `LTRIM` to 500). For accounts with millions of followers (professional athletes), skip fan-out and merge their recent activities at read time. Feed reads fetch IDs from Redis, then hydrate summaries and polylines from the activity DB through a cache.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Activities in Postgres, sharded by `user_id`.** Writes are low (~58/s average, ~600/s peak) and the data is relational. The device UUID as primary key makes the idempotent upload a plain `INSERT ... ON CONFLICT DO NOTHING`, and "my activities" is a single-shard query. Cassandra would scale too, but at this rate it buys nothing and loses unique constraints and transactions.
+- **Segments in PostGIS** because matching needs real geometry: spatial indexes, distance-to-line, corridor checks. A key-value store with geohash keys could find candidates, but the matcher would have to reimplement geometry. Segments are read-mostly, so read replicas carry the load.
+- **Efforts in Cassandra:** ~25M/day of append-only rows (~9B/year), always read by `segment_id`. That access pattern is a natural partition key, and the volume outgrows a single Postgres.
+- **Redis for leaderboards and feeds:** derived and rebuildable, so BASE is fine. A leaderboard a minute behind is within the freshness requirement.
+- **What needs ACID:** activity creation (exactly once), visibility and privacy-zone settings, and account deletion. When a user switches an activity to "only me", feed hydration and leaderboards must honour it on the next read. So the feed service re-checks visibility in the activity DB instead of trusting the cached feed.
+- **CAP stance:** the phone is the buffer, so the upload path can be CP. Refusing an upload during a partition costs nothing, because the device retries later. Reads (feeds, leaderboards) are AP and can serve stale data.
+
+### Service boundaries and communication
+
+- **Upload service** is thin, I/O-bound and must always accept bytes. **Activity processor** is CPU-bound (smoothing, stats, polyline). **Segment matcher** is spatial and heavy, and it also runs backfills for new segments. **Feed fan-out, feed service and leaderboard service** are read-optimized.
+- They are split because they scale on different resources, and so a matcher outage leaves uploads and feeds working (see follow-up).
+- **Synchronous:** chunk uploads, `complete` → 202, feed and leaderboard reads.
+- **Asynchronous via Kafka:** everything after `complete`.
+- The upload service writes the blob, the activity row and the Kafka event. Use an outbox row in the same Postgres transaction as the activity insert, so a crash can't leave an activity stuck in `processing` with no event.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Weekend-morning 10× surge (~600 uploads/s) | Processing lag; 1-minute freshness slips | Kafka absorbs the burst; autoscale processors and matchers on consumer lag; pause segment backfills (a separate topic and consumer group) during peaks |
+| Corrupt or huge trace (multi-day ride) crashes the processor | Partition blocked; that user's activity never publishes | Bounded retries with backoff, then DLQ; activity marked `failed` with the raw blob kept for reprocessing after a fix |
+| Upload interrupted mid-chunk | Partial trace on the server | Resumable chunks; `complete` verifies `sha256` and all parts before emitting the event; client keeps its local copy until processed |
+| Redis leaderboard shard lost | Segment pages show no ranks | Replica promotion; otherwise rebuild that shard's sets from Cassandra efforts; segment page renders with "leaderboard updating" instead of failing |
+| Feed Redis slow or cold | Feed reads time out | Short timeout, then fall back to pulling recent activities of followees from the activity DB (slower, bounded to top N followees) |
+| Segment backfill hammers PostGIS | Live matching slows | Backfills read from a dedicated replica (bulkhead) and are rate-limited |
+
+### High availability and disaster recovery
+
+- **Zone level:** Postgres synchronous standbys, Cassandra RF 3 across zones, Kafka RF 3 with `min.insync.replicas=2`, Redis replicas (rebuildable anyway), stateless services in three zones. Zone failure RTO is minutes and automatic.
+- **Region level:** one active region with a warm standby is justified here. Unlike chat, a regional outage mostly means delayed uploads: recording works offline, and devices keep activities until the server confirms processing. Once processed, the server holds the only copy of someone's years of training history. So:
+  - Activity DB and efforts replicate asynchronously cross-region (**RPO under 1 minute**).
+  - Blob storage uses cross-region replication plus object versioning against accidental deletes.
+  - **Regional RTO target is ~1 hour.**
+- **Backups:** nightly Postgres snapshots with WAL archiving for point-in-time recovery, and Cassandra snapshots. Leaderboards and feeds are not backed up, only rebuilt.
+
+### Security
+
+- **Authn:** OAuth tokens for the app and for third-party apps using the public API, with scoped permissions such as reading private activities. Partner device imports (Garmin and others) use per-partner credentials held in a secrets manager and rotated.
+- **Authz:** activity visibility (public, followers, only me) is enforced at every read path: activity fetch, feed hydration, leaderboards, segment efforts. Privacy zones are applied when building public polylines.
+- **PII:** GPS traces reveal home and work addresses, and heart rate is health data. Encrypt the blob store and databases at rest with KMS-managed keys, restrict raw-trace access to the processing services, and audit-log any staff access. Account deletion must remove traces, efforts, leaderboard entries and feed entries, and drop the user from the next heatmap build.
+- **Aggregate leaks are real.** Strava's public heatmap famously exposed military bases in 2018. Exclude private activities and privacy zones from aggregates, and let users opt out.
+- **Abuse:** per-user upload limits with a separate bulk-import quota, rate limits on profile and segment APIs to slow location scraping, and audit logs for leaderboard moderation.
+
+### Observability
+
+- **SLIs and SLOs (30 days):**
+  - 99% of activities appear in feeds and leaderboards within 60 s of `complete`, measured from timestamps carried on the Kafka events.
+  - 99.9% of upload API requests succeed (non-5xx).
+  - 99% of feed reads within 300 ms.
+  - 99.99% of accepted uploads reach `published` or an explicit `failed` within 1 hour, so nothing silently gets stuck.
+- **Client telemetry:** track the age of activities in the app's `queued_upload` state. A spike reveals auth or upload bugs that look like silence from the server side.
+- **Dashboards:** Kafka lag per consumer group, processing time, DLQ depth, PostGIS latency.
+- **Tracing:** `activity_id` is the correlation key, with trace context propagated in Kafka headers. One trace then follows upload → processor → matcher → fan-out.
+- **Paging:** burn rate on freshness and upload success, and DLQ growth. Lag alone is a ticket unless it threatens the 60 s SLO.
+
+### Performance and cost
+
+**Bottleneck:** the weekend-morning burst through processing and segment matching. Levers:
+- Cache segment candidates by geohash cell in matcher memory, since segments are read-mostly. Most activities then never hit PostGIS for candidate lookup.
+- Pipeline Redis leaderboard writes.
+- Autoscale workers on lag rather than CPU.
+
+**Cost drivers:**
+- **Trace storage:** 575 GB/day raw is ~210 TB/year. Storing the ~5× compressed form (~20–25 KB each, ~125 GB/day) makes it ~46 TB/year. Move traces older than ~90 days to an infrequent-access tier: the map uses the polyline in the DB, so old raw traces are rarely read. The trade-off is retrieval fees and slower reprocessing when a new segment's backfill touches old traces.
+- **Redis memory:** leaderboards (~50 GB) plus feeds, which take 500 IDs × 8 bytes ≈ 4 KB per user, about 120 GB for 30M DAU before Redis overhead. Keep materialized feeds only for active users and rebuild on demand for returners, who then pay a slower first load.
+- **Peak-shaped compute:** provisioning for 10× all week is wasteful. Queue-fed, idempotent workers can run on autoscaled or preemptible capacity, since a preempted job just retries.
+
 ## Follow-up questions
 
 ### How would you build live tracking for spectators?

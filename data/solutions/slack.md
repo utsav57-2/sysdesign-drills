@@ -207,6 +207,77 @@ Discord's approach (ScyllaDB): partition key (`channel_id`, `bucket`) where the 
 
 Edits and deletes flow through the same Kafka topic keyed by `message_id`, so the index converges within seconds. Per-user permission filtering after retrieval alone is a weak approach: if most top hits are filtered out, the page comes back nearly empty.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Metadata DB (MySQL/Postgres, sharded by `workspace_id`) needs ACID.** Creating a private channel with its first members, or removing someone from a channel, must be atomic and immediately visible to the permission checks on send, subscribe and search. If a removed user keeps receiving a private channel for minutes, that is a data leak. Almost all metadata queries stay inside one workspace, so sharding by workspace keeps transactions single-shard.
+- **Message store (Cassandra/ScyllaDB)** fits append-heavy writes (~11,600/s, ~35k/s peak), range reads per (channel, bucket), and 365 TB/year of growth. Writes and reads both use quorum, so an acknowledged message survives a node loss and is visible to the next history fetch. If a quorum can't be reached, the send fails and the client retries; the system never acks and then loses a message. Ordering comes from Snowflake IDs and the channel server, not from database transactions.
+- **Idempotency keys** live in Redis (`SETNX`, ~24 h TTL); a Cassandra lightweight transaction would add Paxos round trips to every send.
+- **Read state is BASE.** It is a monotonic max pointer, so a stale replica shows a channel as unread for a second at worst. Redis is a cache in front of it.
+- **Elasticsearch is eventually consistent by design** and never authoritative for permissions.
+- **CAP stance:** sends and membership are CP (refuse rather than lose or leak); live delivery is AP (best-effort push, with the store as the truth); unreads and search are AP.
+
+### Service boundaries and communication
+
+- **Gateways** hold 10M sockets and nothing else; every deploy forces up to 50k reconnects per host, so they stay thin and deploy rarely. The **message API** is stateless, holds the business logic, and changes often.
+- **Channel servers** hold soft in-memory subscription maps and define per-channel order.
+- **Search, push notifier and presence** are separate consumers that can lag or fail without touching messaging.
+- **Synchronous:** the client's POST waits for the quorum write only. That is the durability promise.
+- **Fire-and-forget after commit:** the publish to the channel server. A missed publish is repaired by client catch-up.
+- **Asynchronous via Kafka:** search indexing and push. They tolerate seconds, and Kafka lets them replay. The DB write and Kafka publish are a dual write, so use an outbox table or CDC from the message store. Otherwise a crash between them leaves a message unsearchable and un-notified.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Gateway host crashes | 50k clients reconnect and all call `GET /unreads` at once | Client backoff with jitter (deep dive); gateways cap new connections per second; unreads API sheds load and serves a cached sidebar first |
+| Message store quorum unavailable for a partition | Sends to those channels fail | Return 503, never a false 201; client retries with backoff and the same idempotency key; the UI shows the message as "sending" |
+| Crash between DB write and Kafka publish | Message missing from search and push | Outbox or CDC; indexer upserts by `message_id`, so replay is idempotent |
+| APNs/FCM throttling or outage | Notification backlog grows | Separate worker pool (bulkhead), retries with backoff, DLQ for permanent failures, drop notifications older than ~10 minutes since they no longer help |
+| Hot channel overloads its channel server | Delivery latency rises for every channel on that server | Per-channel publish rate limits, replicated subscriber maps for hot channels (deep dive), shed typing/presence events first |
+| One enterprise workspace overloads Elasticsearch | Search slows for co-located tenants | Dedicated index for big tenants, per-tenant query concurrency limits, search timeouts; messaging is unaffected |
+
+### High availability and disaster recovery
+
+- **Zone level:**
+  - Cassandra RF 3 with one replica per zone and LOCAL_QUORUM, so a zone loss loses no acked message (RPO 0).
+  - The metadata DB primary has a synchronous standby in another zone and fails over automatically in under a minute.
+  - Channel servers are soft state, rebuilt when gateways resubscribe. Redis read-state cache rebuilds from Cassandra.
+- **Region level:** each workspace has a home region, which also meets enterprise data-residency needs. Message and metadata stores replicate asynchronously to a standby region, so a full regional disaster has an **RPO of a few seconds** and an **RTO of ~30 minutes**. Synchronous cross-region quorum would add tens of ms to every send for an event that is very rare.
+- **Backups:** replication also copies mistakes (a bad migration, a buggy bulk delete), so take daily snapshots plus binlog/commitlog for point-in-time recovery. Elasticsearch is rebuilt from the message store; customers tolerate stale search far more than broken chat.
+
+### Security
+
+- **Tenant isolation:** `workspace_id` comes from server-side lookup and is enforced in the data-access layer on every query. Search is routed and filtered by workspace and by the user's channel IDs.
+- **Membership is checked at send (403), at gateway subscribe, at history fetch and at search.** A membership-removed event must unsubscribe the user's sockets from a private channel immediately.
+- **Encryption:** TLS for WebSockets and service calls, and encryption at rest per workspace using envelope keys from a KMS. Enterprise tiers can use customer-managed keys, which allows revocation. Rotation re-wraps data keys, not 365 TB of data.
+- **Secrets:** APNs/FCM credentials and DB passwords live in a secrets manager with automated rotation.
+- **Audit logs** for logins, admin actions, exports, membership and retention-policy changes, kept immutable for compliance. Per-workspace retention and legal hold must reach Cassandra, Elasticsearch and backups.
+- **Abuse:** per-user and per-channel send limits, a message size cap, concurrent sockets per user, invite rate limits.
+
+### Observability
+
+- **SLIs and SLOs (30 days):**
+  - 99.9% of messages delivered to online recipients within 500 ms, measured by synthetic sender/receiver clients in each region plus client-reported receive times.
+  - 99.95% of valid sends return 201.
+  - 99.9% of WebSocket connects succeed within 2 s.
+  - 99% of messages searchable within 10 s.
+- **Dashboards:** connections and reconnect rate per gateway, publish-to-gateway latency, channel server queue depth, Cassandra quorum latency, Kafka lag for search and push, push success rate.
+- **Tracing:** trace the send path (API → store → channel server → gateway) with `message_id` as the correlation key, so "Bob never got it" can be followed hop by hop.
+- **Paging:** burn-rate alerts on delivery and send success. A single gateway dying or high Cassandra CPU is a ticket.
+
+### Performance and cost
+
+**Bottleneck:** fan-out work on gateways and hot channel servers (~230k socket writes/s on average, roughly 3× at peak). Levers:
+- In busy channels, coalesce several messages into one frame every ~20–50 ms. This saves syscalls at the cost of a little latency.
+- Enable WebSocket compression for history-heavy payloads. Disable it on gateways that are CPU-bound, since it trades CPU for bandwidth.
+
+**Cost drivers:**
+- **Message storage grows forever:** 1 TB/day ≈ 365 TB/year, and ×3 replicas ≈ 1.1 PB/year. Compress SSTables, and move buckets older than ~1 year to cheaper storage or object storage. The trade-off is slower scrollback into old history. Paid-plan retention limits also shrink this.
+- **Cross-region standby** doubles storage and adds ~1 TB/day of replication egress. Offer it only to tiers that need it, or accept a longer region RTO from backups for the rest.
+- **Operational complexity:** five stateful systems (MySQL, Cassandra, Redis, Kafka, Elasticsearch) need five on-call skill sets. A smaller team could keep messages in sharded MySQL (Slack's own choice via Vitess) and drop one system.
+
 ## Follow-up questions
 
 ### How do you guarantee message order within a channel?

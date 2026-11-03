@@ -159,6 +159,85 @@ To get the *top* items, keep a small min-heap of the current top-K alongside the
 - Use active-active regions with asynchronous replication of tweets; timelines and caches are rebuildable per region.
 - Snowflake worker IDs are unique per region and machine, so IDs never collide across regions.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Tweets in Cassandra/Manhattan** (see the follow-up for why not Postgres). The key property for multi-region is that tweets are **immutable and keyed by a globally unique Snowflake ID**. Two regions accepting writes concurrently can never conflict, which is why active-active with asynchronous replication is safe here. Writes use LOCAL_QUORUM, so a zone loss loses nothing that was acknowledged.
+- **Users in sharded MySQL.** Handles must be globally unique, which needs ACID and a unique constraint. Route handle registration and renames to **one home region** (CP for that rare operation) rather than risk two people getting `@alice` during a partition. Profile edits are last-writer-wins.
+- **Follow graph** is eventually consistent (BASE). A new follow showing up in timelines a few seconds late is fine. **Blocks and protected-account approvals are the exception.** They are safety features, so they're enforced at read time (hydration and search filter against current graph state), not by trusting precomputed timelines.
+- **Likes and counters:** the like edge is the truth; counts are approximate and eventually correct. **Timelines (Redis) and the search index** are derived and rebuildable.
+- **CAP stance:** AP almost everywhere, per the requirements: availability over consistency, survive a region. The CP exceptions are handle uniqueness and account security changes such as password and 2FA.
+
+### Service boundaries and communication
+
+- **Tweet, timeline, social graph, search, media, fan-out, counters and notifications** are split along load shape. The timeline service carries ~70k reads/s (300k peak) and must be isolated from write bursts. Fan-out scales with followers per tweet, not tweet count. Search and counters can lag without hurting posting.
+- **Synchronous:**
+  - `POST /tweets` waits for the tweet-store write only.
+  - Timeline read: Redis + celebrity cache + tweet cache `MGET`.
+  - Follow/unfollow.
+  - Media uploads go straight to object storage via presigned URL, so bytes never pass through our services.
+- **Asynchronous via Kafka:** fan-out, indexing, counters, notifications, abuse classifiers. A follow also triggers an async backfill of the followee's recent tweets into the follower's timeline.
+- **`POST /tweets` should take an idempotency key** (the API above lacks one). A mobile client retrying after a timeout would otherwise post the tweet twice.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Fan-out backlog at ~20k tweets/s during a live event | Tweets reach timelines late | Kafka absorbs it; separate consumer groups and worker pools (bulkheads) so indexing and counters can't starve fan-out; fan out to recently active users first |
+| Celebrity tweet makes one cache key hot | Shard serving that key saturates | Replicate hot keys, in-process caches with short TTL, request coalescing (follow-up) |
+| Redis timeline shard lost or cold | Affected users' timelines empty or slow | Fall back to pull-based timelines; rate-limited background rebuild (follow-up) |
+| Tweet store slow in one zone | Hydration misses the 200 ms budget | Tweet cache absorbs most reads; per-call timeouts with hedged reads to another replica; drop unhydrated tweets from the page rather than fail it |
+| Client retries a post after timeout | Duplicate tweet | Idempotency key stored with the tweet; retry returns the original ID |
+| Counter aggregator crashes and replays | Like counts double-count | Batched `+N` updates carry Kafka offsets for dedupe; periodic reconciliation recounts from like edges for hot tweets |
+
+### High availability and disaster recovery
+
+- **Zones:** Cassandra RF 3 across zones, MySQL with a synchronous standby, Kafka RF 3, Redis with replicas. A zone loss has RPO 0 and an automatic RTO of minutes.
+- **Regions:** active-active (deep dive). The extra decisions:
+  - **Capacity headroom.** With three regions, each must be able to absorb another's share, so each runs at ~65% of its total capacity at peak. Losing a region pushes the other two to ~100% (1.5 × 65% ≈ 98%).
+  - **RPO on region loss** is the few seconds of tweets not yet replicated. That's acceptable for a social product, and it is stated publicly as eventual consistency.
+  - **RTO is minutes:** DNS or anycast steering shifts users away from the failed region.
+  - Timelines are not replicated cross-region (1.3 TB each); each region rebuilds its own.
+- **Backups:** replication copies bugs too. Cassandra snapshots to object storage and MySQL point-in-time recovery protect against a bad deploy or mass deletion.
+
+### Security
+
+- **Authn:** OAuth for users and third-party apps, with scoped tokens (read vs write vs DM). 2FA, plus login anomaly detection for account takeover.
+- **Authz:**
+  - Protected accounts are visible only to approved followers.
+  - Blocks are enforced at hydration and in search.
+  - Deleted tweets are tombstoned so hydration drops them immediately.
+- **Internal tools are a top risk.** The 2020 takeover of high-profile accounts came through employee access to admin tooling. Require least privilege, two-person approval for account-level actions, and **immutable audit logs** of every admin and moderation action.
+- **Encryption:** TLS everywhere, encryption at rest via KMS-managed keys with rotation, and secrets (DB credentials, push certificates, signing keys for presigned URLs) in a secrets manager.
+- **PII:** emails, phone numbers and IP logs are access-restricted and kept for a limited time. Account deletion propagates to tweets, the search index and caches.
+- **Abuse:** per-account and per-IP limits on posting, follows and reads (scraping), plus known-bad media hash matching on upload; spam handling is in the follow-ups.
+
+### Observability
+
+- **SLIs and SLOs (30 days):**
+  - 99.9% of home timeline requests succeed, and 99% complete within 200 ms.
+  - 99.95% of `POST /tweets` succeed.
+  - 99% of tweets from non-celebrity accounts appear in followers' timelines within 5 s, measured by canary accounts in each region that post and read.
+  - 99% of tweets are searchable within 10 s.
+- **Dashboards:** Kafka lag per consumer group, fan-out writes/s, timeline and tweet cache hit rates, cold-rebuild rate, hot keys, per-region traffic share.
+- **Tracing:** timeline reads (Redis, celebrity merge, hydration). Propagate `tweet_id` through Kafka headers so one tweet's path through fan-out and indexing can be followed.
+- **Paging:** burn rate on timeline availability and latency, and the canary freshness SLIs. Kafka lag alone is a ticket until it threatens the 5 s target.
+
+### Performance and cost
+
+**Bottleneck:** fan-out writes plus timeline reads at 300k/s peak. Fan-out volume is 6k tweets/s × average follower count. If the average push audience is ~200 (an assumption, since celebrities are excluded), that is ~1.2M Redis inserts/s. Levers:
+- Pipeline those inserts in batches per Redis shard.
+- Batch hydration with `MGET`.
+- Keep the celebrity threshold tunable. Lowering it cuts fan-out writes but makes every read merge more authors.
+
+**Cost drivers:**
+- **Timeline RAM:** 1.3 TB per region × 2 (replica) × 3 regions ≈ 7.8 TB of Redis. Halving the stored IDs from 800 to 400 halves that. Deeper scrolls then fall back to the slower pull path.
+- **Tweet storage:** 55 TB/year × RF 3 × 3 regions ≈ 500 TB/year before compression. Move tweets older than a year to cheaper storage with fewer replicas in non-home regions. Old-tweet reads then get slower and cross regions.
+- **Media and CDN egress** (excluded from the estimates) is in practice larger than everything above. Transcode to efficient formats and size images per device.
+- **Cross-region replication** of tweet text is modest, ~150 GB/day to each other region. Replicating media is the expensive part, so replicate it lazily on first request.
+- **N+1 regional headroom** is pure idle cost, the price of surviving a region loss.
+
 ## Follow-up questions
 
 ### How do you handle a celebrity with 100M followers tweeting during a live event?

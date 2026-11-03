@@ -156,6 +156,69 @@ Either both the post and its event exist, or neither does.
 
 - Candidate generation (feed + celebrity posts + recommendations) → feature lookup (affinity, recency, engagement) → ML scoring → re-ranking for diversity. Precompute scores asynchronously where possible to stay within the latency budget.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **DynamoDB/Cassandra for posts and follows.** Both are huge (2B users, 500M posts/day) and only ever accessed by key: posts by `post_id` or `author_id, created_at`, follows by `follower_id` or (via the GSI) `followee_id`. A relational database would need manual sharding at this size, and the only cross-table query, "posts from people I follow", is precisely what we precompute instead of joining. The trade-off is that the reverse follow index (GSI) is updated asynchronously, so a follower list read during fan-out may miss a follow made a moment ago. That's within the 1-minute freshness requirement.
+- **Outbox on a NoSQL store:** the deep dive's "one DB transaction" needs atomicity across the post and outbox rows. On DynamoDB that's a two-item `TransactWriteItems`, or simpler, use the table's change stream (DynamoDB Streams, or Cassandra CDC) as the outbox, so the post write alone is the source of the event.
+- **Redis for feeds: pure BASE.** A feed is a derived, rebuildable cache, so losing a write only delays a post. Nothing in the feed path needs ACID.
+- **What does need stronger guarantees:** a post write must be durable before the 201 (quorum write), and deletes must be honored on read, which is why hydration checks the post store's deleted flag rather than trusting feed contents.
+- **CAP stance:** **AP** across the board. The requirement says a post can take a minute to appear, and "highly available" matters more than everyone seeing the same feed at once.
+
+### Service boundaries and communication
+
+- **Post, follow and feed services** plus **fan-out workers**. They're split by load shape: feed reads (60k/s, peak 200k/s) are latency-critical, fan-out (1.2M inserts/s) is bulk background work, and posts (6k/s) are modest writes. Fan-out in its own worker pool means a celebrity storm or a backlog can't slow feed reads.
+- **Synchronous:** creating a post (until durable), follow/unfollow, and feed reads with hydration from the post cache.
+- **Asynchronous:** everything triggered by a post: fan-out, counters, ranking feature updates, media processing. Kafka absorbs bursts and lets each consumer group fail and replay independently.
+- **Not split:** the celebrity merge stays inside the feed service; a separate "merge service" would add a hop to a 500 ms budget.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Fan-out lag grows (a burst of popular authors) | New posts appear late | Autoscale on consumer lag; prioritize active followers; alert when lag nears the 1-minute freshness limit |
+| Redis feed shard lost | Affected users have empty feeds | Replica promotion; **graceful degradation** to fan-out on read for those users while workers rebuild |
+| Post cache or store slow during hydration | Feed p99 over 500 ms | **Timeout** per bulk call (~100 ms) with one retry; return the posts that hydrated and drop the rest rather than failing the whole page |
+| Poison event in Kafka (malformed payload) | Partition consumer stuck | After a few **retries with backoff and jitter**, send to a **DLQ** and continue; alert on DLQ growth |
+| Celebrity misclassified, 50M-follower fan-out starts | Fleet saturated for ~50 s, other posts delayed | Check follower count before fan-out; separate worker pool (**bulkhead**) for large fan-outs |
+| Read spike after a major event (peak 200k reads/s) | Feed service and Redis overloaded | Short per-user cache of the merged page (~30 s), **load shedding** of ranking extras before basic feed reads |
+
+### High availability and disaster recovery
+
+- **SPOFs:** Kafka (replicated across three zones), Redis (replica per shard in a different zone), the outbox relay (run it as a consumer group so a crashed instance hands off its partitions). Stateless services run in several zones behind the gateway.
+- **Regions:** active-active in several regions, since users are global. Replicate posts and follows across regions; each region consumes `post_created` and runs its **own** fan-out into its own Redis, rather than shipping 1.2M feed inserts/s across regions.
+- **Targets:** posts and follows **RPO of seconds** (async cross-region replication; a post made seconds before a region dies may be lost, which is acceptable for social content), **RTO of minutes** via DNS or anycast failover. Feeds have no RPO: they're rebuilt. Daily backups plus point-in-time recovery on posts and follows guard against bad deploys and logical corruption.
+
+### Security
+
+- **Authn/authz:** token auth at the gateway; author ID comes from the token. Hydration enforces visibility: blocked users, private accounts and deleted posts are filtered on read, because the feed cache may contain IDs the viewer can no longer see.
+- **Encryption:** TLS externally and internally; at-rest encryption on posts, follows and Redis snapshots.
+- **Secrets:** service credentials from a secrets manager, rotated automatically.
+- **PII:** follows reveal relationships and are sensitive; account deletion must remove posts, follow edges in both directions and feed entries (lazily on read, plus a background purge).
+- **Audit:** log moderation actions and admin access to private accounts.
+- **Abuse:** per-user post and follow rate limits (follow-spam bots are common), detection of bulk follow/unfollow patterns, and spam scoring before fan-out so spam isn't copied into millions of feeds.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 99% of feed requests return within 500 ms; 99.95% succeed.
+- 99% of posts reach active followers' feeds within 60 s (measured by canary accounts that post and read).
+- 99.99% of acknowledged posts are durable and visible on the author's profile.
+
+**Metrics:** Kafka consumer lag for fan-out, fan-out inserts/s, Redis memory and ops per shard, cache hit rate for hydration, celebrity merge latency, fallback-to-pull rate.
+
+**Tracing:** feed reads (Redis → celebrity merge → hydration) and post creation through outbox → Kafka → fan-out, linked by `post_id`, so you can see where freshness is lost.
+
+**Paging:** burn rate on feed latency and errors, and canary freshness over 60 s. Rising consumer lag alone is a warning, not a page, until it threatens freshness.
+
+### Performance and cost
+
+- **Main bottleneck:** fan-out, ~1.2M inserts/s. Levers already covered: hybrid push/pull, skip inactive users, pipelining. Tune the celebrity threshold using fan-out lag vs merge latency.
+- **Feed cache memory:** ~2 TB, ~4 TB with one replica each. Levers: cap at 200 entries instead of 500 (≈ 0.8 TB, deeper pages fall back to slower pull queries); evict users inactive for 7 days rather than 30 (smaller cache, more on-demand rebuilds).
+- **Multi-region:** a full feed cache per region multiplies the 4 TB. Running fan-out per region keeps cross-region traffic to post events: 6k/s × ~1 KB (assumed post size) ≈ 6 MB/s, versus replicating 1.2M inserts/s.
+- **Post storage** grows ~500 GB/day at ~1 KB per post before replication; old posts move to cheaper storage tiers since they're rarely read.
+
 ## Follow-up questions
 
 ### How do you choose the celebrity threshold?

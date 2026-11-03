@@ -209,6 +209,64 @@ Players ranked 5,000,000th vs 5,000,412th don't care about the exact number. Kee
 - "My rank" is per player, so it goes to read replicas. Replica lag of milliseconds is acceptable.
 - Push updates to players watching a live board by publishing the refreshed snapshot over WebSockets or SSE.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Kafka + durable score store (Postgres or DynamoDB) as the record; Redis as a rebuildable index.** The durable store holds `(board_id, player_id) → score` and the dedupe keys. Each update is one row, keyed by player, so a key-value store fits; Postgres is chosen if you also want ad hoc queries and season-end reports. Either way, the write that matters (dedupe + score update) is a single-row conditional write, so we don't need multi-row ACID.
+- **Why not Redis alone:** Redis persistence (AOF every second) and async replication can lose the last second of increments on failover; the requirement says scores are never lost, so Kafka and the durable store carry that promise.
+- **ACID vs BASE:** score acceptance needs exactly-once *effect* (idempotency key per match and player), which we get from dedupe on the durable row, not from distributed transactions. Ranks are BASE: a rank that is a second behind or slightly different on a replica is fine.
+- **CAP stance:** score ingestion is **CP** on the durable path (reject or retry rather than lose or double-count, because rewards depend on it). Reads are **AP**: during a Redis primary failover, keep serving the last top-100 snapshot and replica ranks rather than errors.
+
+### Service boundaries and communication
+
+- **Score API** (authenticates game servers, appends to Kafka), **Leaderboard writer** (dedupe, durable write, Redis updates), **Read service** (top-N snapshot, rank lookups, name joins) and a **season/archive job**. Writer and reader are split because reads peak at 25k/s and must keep working when the writer is behind or redeploying.
+- **Synchronous:** game server → Score API → Kafka append, returning 202 once the event is durable in Kafka; client → read service → snapshot or replica.
+- **Asynchronous:** Kafka → writer → durable store and Redis; the 1 s snapshot refresh; pushes to watchers; analytics consumers. The 1 s freshness budget leaves room for this hop.
+- **Don't split** per window: one writer updating all of a player's board keys keeps them consistent.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Redis primary fails | Last ~1 s of increments missing; brief write unavailability | Replica promotion; writer replays from Kafka a little before the last committed offset, and idempotent dedupe makes replay safe |
+| Writer falls behind (tournament round ends at once) | Ranks lag beyond 1 s | Kafka absorbs the burst; scale writers up to the partition count; batch Redis commands per pipeline; alert on consumer lag in seconds |
+| Durable store slow or unavailable | Writer can't commit; Redis would get ahead of the record | Writer stops committing offsets and retries with backoff + jitter; events wait in Kafka rather than being dropped |
+| Malformed or implausible score event | Writer crashes or a cheater tops the board | Validate in the API; failed events after bounded retries go to a dead-letter topic; plausibility checks quarantine suspicious scores (see follow-ups) |
+| Read spike at season end | Rank lookups saturate replicas | Top N already served from the 1 s snapshot/CDN; add replicas; under overload shed "neighbors" before "my rank", and serve cached ranks a few seconds old |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the Redis primary per board (replicas in other zones with automatic failover, e.g. a sentinel or managed failover), the writer (multiple consumers in a group; a dead one's partitions are reassigned), Kafka (replication factor 3 across zones).
+- **Zone vs region:** multi-zone within a region is enough for most games. For global titles, regional boards are independent; a global board takes events from all regions into one writer cluster with read replicas everywhere, as in the follow-up.
+- **RPO/RTO:** scores **RPO 0** once the API returns 202 (Kafka acks after replication to in-sync replicas, `acks=all`). Redis **RPO ~1 s** is acceptable because it is rebuilt from the record. **RTO:** reads **≤ 30 s** (replica promotion, snapshot keeps serving meanwhile); a full rebuild of a 100M-member board takes minutes (pipelined `ZADD` from the durable store), which bounds the worst-case RTO.
+- **Backups:** point-in-time recovery for the durable store; season-end snapshots archived permanently because rewards are paid from them.
+
+### Security
+
+- **Authn:** game servers authenticate with mutual TLS or signed requests; clients only read. **Authz:** a game server may only submit for its own game and for players in that match, which the API verifies against the match service's record.
+- **Integrity is the main threat:** cheating through forged scores. Beyond signatures, rate-limit submissions per player and per server, enforce plausibility rules, and keep an audit trail of every score event (Kafka plus durable events) to investigate and reverse bans.
+- **PII:** minimal; display names and region. Show only display names publicly; let players opt out of global boards or appear anonymized.
+- **Encryption and secrets:** TLS on all hops including Redis; per-server signing keys and certificates in a secret manager, rotated and revocable when a server is compromised.
+- **Audit and read abuse:** log bans, manual score corrections and season resets with operator identity; rate-limit rank lookups per client to stop full-board scraping.
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of accepted scores reflected in ranks within 1 s (measured from Kafka append time to Redis write).
+  - 99.9% of top-N and "my rank" reads served under 50 ms.
+  - Zero accepted scores lost, reconciled daily: durable totals vs. Kafka event sums vs. Redis scores on a sample.
+- **Dashboards:** events/s per game, consumer lag in seconds, Redis memory per board, snapshot age, dedupe hit rate (a spike means game servers are retrying), quarantined scores.
+- **Traces:** submissions through API → Kafka → writer → durable store → Redis, keyed by `matchId`.
+- **Paging:** burn rate on freshness and read-latency SLOs, and any reconciliation mismatch. Redis CPU or one slow writer is a ticket unless it threatens the SLO.
+
+### Performance and cost
+
+- **Bottleneck:** writes fan out to every window, so 12k events/s at peak become ~48k Redis updates/s across daily, weekly, season and all-time boards, plus the Lua read-modify-write for composite scores. Pipeline updates per batch, keep one player's board keys together where possible, and shard boards across nodes when a node nears ~100k ops/s.
+- **Redis memory (main cost):** ~10 GB per all-time board, ~1 GB per daily board, plus weekly and season boards, multiplied by replicas (say 1 primary + 2 replicas = 3×) and by the number of games. Levers: expire windows promptly, keep exact sets only for the top tier and use histograms for the long tail (few KB instead of 10 GB, at the cost of approximate ranks), and drop inactive players from all-time boards.
+- **Reads are cheap:** the 1 s snapshot turns 25k top-N reads/s into one Redis call per second per region.
+- **Durable storage and Kafka are small:** 100M events/day × ~100 B ≈ 10 GB/day before replication; keep Kafka retention a few days for replay and compact older events into the durable store.
+
 ## Follow-up questions
 
 ### How would you show a leaderboard of just my friends?

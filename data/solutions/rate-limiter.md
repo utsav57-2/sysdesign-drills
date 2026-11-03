@@ -258,6 +258,69 @@ return { allowed, math.floor(tokens) }                   -- Lua numbers return a
 
 - Store rules in a DB or config service; gateways poll every ~10 s or subscribe to change notifications. Apply them atomically and version them so a bad rule can be rolled back quickly.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Redis for bucket state.** 1M atomic read-modify-writes per second at sub-millisecond latency rules out any disk-backed database, and purely local in-memory counters fail the "no N× limit across 100 gateways" requirement. The state is small (1–2 GB) and **disposable**: if a bucket is lost, the client gets a full bucket, which means a brief over-admission, not data loss. No durable persistence is needed.
+- **Rules in a small relational store or config service.** Rules are edited by people, versioned, and must be applied all-or-nothing. A half-applied change ("free tier: 0 req/min") is an outage. ACID and a version number per rule set suit this; gateways cache the whole set.
+- **CAP per path:** counters are **AP**. Replication is async and Redis failover can lose seconds of counts, and on a partition gateways fail open. Over-admitting a few percent for a few seconds is far cheaper than rejecting all API traffic. For login, password reset and OTP rules the stance flips to **CP**: fail closed, because there the limiter is a security control.
+
+### Service boundaries and communication
+
+- **The limiter is a library/middleware in the gateway, not a separate service.** A standalone limiter service would add a network hop to every one of 1M requests/s and another fleet that can fail. The only remote call is the Redis script.
+- **Rules service** is separate and off the hot path: gateways poll or subscribe asynchronously, so a rules-store outage just freezes the current rules.
+- **Sync vs async:** the check is synchronous by necessity (the request can't proceed without a verdict), so it gets a 5 ms timeout. Everything else is async: rule distribution, emitting 429 events for analytics, and cross-region count syncing (follow-up).
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Redis shard primary fails | ~1/15 of clients unlimited for a few seconds | Replica promotion; fail open with the local per-node backstop; fail closed for security rules |
+| Redis slow (latency spike) | Gateway threads pile up waiting | 5 ms timeout and circuit breaker (deep dive); alert on fail-open rate |
+| One client at 100k req/s (hot key) | Its shard saturates and slows every client sharing it | Local allowance batching (deep dive); a coarse per-IP pre-limit on each node before the Redis call |
+| Bad rule pushed (paid tier set to 0) | Mass false 429s | Schema checks and floors on rule values; canary the new version on a few gateways; auto-rollback if the 429 rate jumps |
+| Random API key flood | Every fake key creates a new bucket, so Redis memory grows | Limit by key only *after* the key is validated; before that, limit by IP |
+| Volumetric DDoS beyond gateway capacity | Gateways saturate before the limiter runs | Not this component's job: edge/CDN filtering and load-balancer load shedding sit in front |
+
+### High availability and disaster recovery
+
+- **SPOFs:** gateways are stateless behind the load balancer; each Redis shard has a replica in another zone; rules are cached in every gateway, so the rules store isn't on the request path.
+- **Zone placement tension:** the deep dive puts Redis in the same zone for ~0.5–1 ms round trips, but shard primaries are spread across zones for HA. Accept a cross-zone hop for some shards (still well under 10 ms), or run zone-local limiter clusters with the quota split per zone, which trades accuracy for latency.
+- **Region strategy:** each region runs its own Redis cluster and enforces a regional share of the quota (follow-up). Losing a region means its clients reconnect elsewhere with fresh buckets, which is acceptable.
+- **Targets:** for API traffic, user-facing **RTO is effectively 0**, since fail-open means the limiter never blocks requests. **Enforcement RTO under 30 s** (replica promotion). **Counter RPO: none required**, since seconds of lost counts don't matter and backups of counters would be stale on restore. **Rules: RPO 0**, with every version kept and restorable.
+
+### Security
+
+- **Identity order:** apply a cheap IP limit first (protects the auth service), then validate the API key or token, then apply the per-client limit. Only trust `X-Forwarded-For` as set by your own load balancer, or attackers pick their own IP.
+- **Redis access:** private network, Redis ACLs/AUTH, and TLS if policy requires it (it costs CPU and some latency). Credentials come from a secrets manager and rotate with dual users.
+- **No secrets or PII in keys:** use a hash of the API key in `rl:{rule}:{client}`. Key names show up in slow logs and debugging tools.
+- **Audit:** every rule change and allowlist entry, with author and reason.
+- **Abuse:** the limiter *is* the abuse control. Tune login/OTP rules with security teams, and report top limited clients to bot detection.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.9% of checks complete within 10 ms (the stated budget).
+- Fewer than 0.1% of checks fail open.
+- Zero false 429s for a canary client sending at 80% of its limit through several gateways, plus an over-limit canary whose admitted rate must stay within 5% of its limit.
+
+**Dashboards:** 429 rate by rule and tier, top limited clients, Redis ops/s and CPU per shard (to spot hot shards), memory, script latency, fail-open count, and the rule version on each gateway.
+
+**Tracing:** a limiter span in the gateway's request trace, tagged with rule ID and decision.
+
+**Paging:** canary false 429s, check-latency burn rate, and sustained fail-open. A spike of 429s for one client is the limiter working, so it's a dashboard item, not a page.
+
+### Performance and cost
+
+**Bottleneck:** Redis operations. At ~100k ops/s per shard, 1M checks/s needs 10–20 shards, and multiple rules per request multiply that unless they share one script call via hash tags (deep dive). Keep pooled persistent connections and `EVALSHA`; pipeline when a request checks several clients.
+
+**Cost drivers:**
+- **Redis nodes are sized for ops, not memory.** 1–2 GB of state fits on one node; it's the 1M ops/s that needs ~20 primaries plus ~20 replicas. Local allowance batching (50 tokens per claim) cuts ops roughly 50×, to a couple of shards, at the cost of overshoot up to the unspent allowance on each of 100 gateways. Use it for high-limit tiers, not for 5-per-minute login rules.
+- **Cross-zone traffic.** At an assumed ~200 bytes per request/response, 1M checks/s is 200 MB/s, ~17 TB/day, much of it crossing zones if shards are spread. Zone-local clusters remove it, trading some accuracy.
+- **Cross-region sync**, if used, should send aggregated per-client deltas every second or so, not per request.
+- **Operational complexity** is modest; a managed Redis service is usually worth it.
+
 ## Follow-up questions
 
 ### Walk me through what happens at a window boundary with a fixed window counter, and how you'd fix it.

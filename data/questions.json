@@ -27,7 +27,7 @@
       "functional": ["Create a short URL from a long URL (optional custom alias, expiry)", "Redirect short URL to original", "Basic click analytics"],
       "nonFunctional": ["Low-latency redirects (<100ms)", "Short codes must be unique", "Read-heavy (100:1), highly available"],
       "challenges": ["Unique short code generation (counter + base62 vs hashing vs pre-generated keys)", "Caching hot redirects", "301 vs 302 trade-off for analytics"],
-      "concepts": ["hashing", "base62", "caching", "key-generation", "sharding"]
+      "concepts": ["hashing", "base62", "caching", "key-generation", "sharding", "high-availability", "performance", "security"]
     },
     {
       "id": "rate-limiter",
@@ -40,7 +40,7 @@
       "functional": ["Limit requests by user/IP/API key with configurable rules", "Return 429 with retry headers when exceeded"],
       "nonFunctional": ["Adds minimal latency (<10ms)", "Consistent across distributed servers", "Fail-open vs fail-closed decision"],
       "challenges": ["Algorithm choice: token bucket, leaky bucket, fixed/sliding window", "Atomic counters in Redis (Lua scripts)", "Race conditions and clock skew across nodes"],
-      "concepts": ["token-bucket", "redis", "consistency", "api-gateway"]
+      "concepts": ["token-bucket", "redis", "consistency", "api-gateway", "sync-vs-async", "reliability-patterns", "security"]
     },
     {
       "id": "news-feed",
@@ -53,7 +53,7 @@
       "functional": ["Create posts", "Follow users", "View paginated feed of followed users' posts"],
       "nonFunctional": ["Feed loads <500ms", "Eventual consistency acceptable", "Hundreds of millions of DAU"],
       "challenges": ["Fan-out on write vs fan-out on read", "Celebrity / hot-user problem (hybrid approach)", "Cursor-based pagination and feed caching"],
-      "concepts": ["fan-out", "caching", "message-queue", "pagination", "denormalization"]
+      "concepts": ["fan-out", "caching", "message-queue", "pagination", "denormalization", "acid-vs-base", "sync-vs-async", "high-availability"]
     },
     {
       "id": "twitter",
@@ -66,7 +66,7 @@
       "functional": ["Post tweets", "Follow/unfollow", "Home timeline", "Search tweets", "Like / retweet"],
       "nonFunctional": ["Very read-heavy", "Timeline latency <200ms", "High availability over consistency"],
       "challenges": ["Hybrid fan-out for celebrities", "Trending topics computation", "Search indexing at write-time scale"],
-      "concepts": ["fan-out", "inverted-index", "stream-processing", "caching"]
+      "concepts": ["fan-out", "inverted-index", "stream-processing", "caching", "high-availability", "database-selection", "cost-optimization"]
     },
     {
       "id": "instagram",
@@ -79,7 +79,7 @@
       "functional": ["Upload photos/videos", "Follow users", "View feed", "Like and comment"],
       "nonFunctional": ["Media upload reliability", "Fast feed and image loads globally", "Eventual consistency for likes"],
       "challenges": ["Presigned URL uploads to blob storage", "CDN + multiple image resolutions", "Feed generation (see News Feed)"],
-      "concepts": ["blob-storage", "cdn", "presigned-urls", "fan-out", "media-processing"]
+      "concepts": ["blob-storage", "cdn", "presigned-urls", "fan-out", "media-processing", "cost-optimization", "performance", "sync-vs-async"]
     },
     {
       "id": "whatsapp",
@@ -92,7 +92,7 @@
       "functional": ["Send/receive 1:1 and group messages", "Delivered/read receipts", "Offline message delivery", "Media attachments"],
       "nonFunctional": ["Real-time delivery (<500ms)", "Messages never lost, ordered per conversation", "Billions of users"],
       "challenges": ["Persistent connections (WebSockets) and routing between chat servers", "Message ordering and idempotency", "Inbox/offline storage and group fan-out", "Presence at scale"],
-      "concepts": ["websockets", "pub-sub", "message-queue", "consistent-hashing", "cassandra"]
+      "concepts": ["websockets", "pub-sub", "message-queue", "consistent-hashing", "cassandra", "acid-vs-base", "reliability-patterns", "database-selection"]
     },
     {
       "id": "slack",
@@ -105,7 +105,7 @@
       "functional": ["Workspaces & channels", "Send messages / threads", "Unread counts", "Message search"],
       "nonFunctional": ["Real-time delivery", "Large channels (100k+ members)", "Message history durable"],
       "challenges": ["Fan-out to huge channels", "Per-user unread state", "Search across workspace"],
-      "concepts": ["websockets", "pub-sub", "inverted-index", "sharding"]
+      "concepts": ["websockets", "pub-sub", "inverted-index", "sharding", "acid-vs-base", "sync-vs-async", "security"]
     },
     {
       "id": "notification-service",
@@ -118,7 +118,7 @@
       "functional": ["Send via push/SMS/email", "User preferences & opt-out", "Templates and scheduling"],
       "nonFunctional": ["At-least-once delivery", "Rate limiting per user", "Handle spikes (millions/min)"],
       "challenges": ["Queue per channel with retries & DLQ", "Deduplication", "Third-party provider failures"],
-      "concepts": ["message-queue", "idempotency", "retries", "rate-limiting"]
+      "concepts": ["message-queue", "idempotency", "retries", "rate-limiting", "reliability-patterns", "sync-vs-async", "cost-optimization"]
     },
     {
       "id": "live-comments",
@@ -131,7 +131,7 @@
       "functional": ["Post comment on live video", "See new comments in real time", "See past comments when joining"],
       "nonFunctional": ["Real-time (<200ms)", "Millions of concurrent viewers per video"],
       "challenges": ["SSE vs WebSockets", "Pub/sub partitioned by video", "Routing viewers to servers (L7 load balancing)"],
-      "concepts": ["sse", "websockets", "pub-sub", "load-balancing"]
+      "concepts": ["sse", "websockets", "pub-sub", "load-balancing", "acid-vs-base", "sync-vs-async", "cost-optimization"]
     },
     {
       "id": "dropbox",
@@ -144,7 +144,7 @@
       "functional": ["Upload/download files", "Sync across devices", "Share files", "Version history"],
       "nonFunctional": ["Large files (up to 50GB)", "Durability (11 nines)", "Sync latency low"],
       "challenges": ["Chunking + resumable uploads", "Presigned URLs, delta sync", "Conflict resolution", "Metadata DB vs blob storage split"],
-      "concepts": ["blob-storage", "chunking", "presigned-urls", "cdn", "change-data-capture"]
+      "concepts": ["blob-storage", "chunking", "presigned-urls", "cdn", "change-data-capture", "cost-optimization", "database-selection", "high-availability"]
     },
     {
       "id": "pastebin",
@@ -157,7 +157,7 @@
       "functional": ["Create paste", "View paste by link", "Expiration"],
       "nonFunctional": ["Read-heavy", "Low latency reads"],
       "challenges": ["Key generation", "Blob storage for content vs DB metadata", "Expiry cleanup"],
-      "concepts": ["key-generation", "blob-storage", "caching", "ttl"]
+      "concepts": ["key-generation", "blob-storage", "caching", "ttl", "database-selection", "cost-optimization", "security"]
     },
     {
       "id": "key-value-store",
@@ -170,7 +170,7 @@
       "functional": ["put(key, value)", "get(key)", "Configurable consistency"],
       "nonFunctional": ["High availability", "Horizontal scalability", "Tunable consistency"],
       "challenges": ["Consistent hashing & virtual nodes", "Replication, quorum (N/R/W)", "Conflict resolution (vector clocks, LWW)", "Gossip, hinted handoff, Merkle-tree anti-entropy"],
-      "concepts": ["consistent-hashing", "replication", "quorum", "cap-theorem", "gossip"]
+      "concepts": ["consistent-hashing", "replication", "quorum", "cap-theorem", "gossip", "high-availability", "acid-vs-base", "performance"]
     },
     {
       "id": "distributed-cache",
@@ -183,7 +183,7 @@
       "functional": ["get/set/delete with TTL", "Eviction when full"],
       "nonFunctional": ["Sub-millisecond latency", "Scales horizontally", "Survives node failures"],
       "challenges": ["LRU eviction implementation", "Consistent hashing for partitioning", "Hot keys and replication", "Cache invalidation strategies"],
-      "concepts": ["consistent-hashing", "lru", "replication", "caching"]
+      "concepts": ["consistent-hashing", "lru", "replication", "caching", "acid-vs-base", "high-availability", "performance"]
     },
     {
       "id": "youtube",
@@ -196,7 +196,7 @@
       "functional": ["Upload videos", "Stream/watch videos", "Search videos"],
       "nonFunctional": ["Smooth playback with low buffering", "Support huge files", "Global availability"],
       "challenges": ["Multipart upload", "Transcoding pipeline (DAG of jobs)", "Adaptive bitrate streaming (HLS/DASH)", "CDN distribution"],
-      "concepts": ["blob-storage", "cdn", "adaptive-bitrate", "message-queue", "media-processing"]
+      "concepts": ["blob-storage", "cdn", "adaptive-bitrate", "message-queue", "media-processing", "cost-optimization", "sync-vs-async", "high-availability"]
     },
     {
       "id": "spotify",
@@ -209,7 +209,7 @@
       "functional": ["Stream songs", "Search catalog", "Create playlists"],
       "nonFunctional": ["Low start latency", "High availability", "Global scale"],
       "challenges": ["Audio storage + CDN", "Prefetching/caching on client", "Search index"],
-      "concepts": ["cdn", "blob-storage", "inverted-index", "caching"]
+      "concepts": ["cdn", "blob-storage", "inverted-index", "caching", "cost-optimization", "high-availability", "security"]
     },
     {
       "id": "uber",
@@ -222,7 +222,7 @@
       "functional": ["Request ride with fare estimate", "Match nearby driver", "Driver accepts/declines", "Real-time location tracking"],
       "nonFunctional": ["Matching <1 min", "Strong consistency: one driver per ride", "Handle millions of location updates/sec"],
       "challenges": ["Geospatial indexing (geohash / quadtree / Redis GEO)", "High-frequency location writes", "Distributed lock to prevent double-assignment", "Surge handling"],
-      "concepts": ["geohash", "quadtree", "redis", "distributed-lock", "websockets"]
+      "concepts": ["geohash", "quadtree", "redis", "distributed-lock", "websockets", "acid-vs-base", "reliability-patterns", "sync-vs-async"]
     },
     {
       "id": "yelp",
@@ -235,7 +235,7 @@
       "functional": ["Search businesses by location/name/category", "View business details & reviews", "Leave a review (one per user)"],
       "nonFunctional": ["Search <500ms", "Read-heavy", "Average rating consistency"],
       "challenges": ["Geospatial search (PostGIS, geohash, Elasticsearch)", "Maintaining average rating", "Uniqueness constraint per user/business"],
-      "concepts": ["geohash", "quadtree", "elasticsearch", "denormalization"]
+      "concepts": ["geohash", "quadtree", "elasticsearch", "denormalization", "database-selection", "acid-vs-base", "reliability-patterns"]
     },
     {
       "id": "google-maps",
@@ -248,7 +248,7 @@
       "functional": ["Render map tiles", "Directions between two points", "ETA with traffic"],
       "nonFunctional": ["Low latency routing", "Global scale", "Fresh traffic data"],
       "challenges": ["Map tiles + CDN", "Graph partitioning & shortest path (Dijkstra/A*/contraction hierarchies)", "Ingesting live location for traffic"],
-      "concepts": ["cdn", "graph-algorithms", "stream-processing", "geohash"]
+      "concepts": ["cdn", "graph-algorithms", "stream-processing", "geohash", "performance", "cost-optimization", "sync-vs-async"]
     },
     {
       "id": "food-delivery",
@@ -261,7 +261,7 @@
       "functional": ["Browse restaurants & menus", "Place order", "Assign courier", "Track order"],
       "nonFunctional": ["Order consistency", "Real-time tracking", "Peak-hour spikes"],
       "challenges": ["Dispatch / matching", "Order state machine", "Geospatial queries"],
-      "concepts": ["geohash", "state-machine", "message-queue", "websockets"]
+      "concepts": ["geohash", "state-machine", "message-queue", "websockets", "sync-vs-async", "reliability-patterns", "acid-vs-base"]
     },
     {
       "id": "ticketmaster",
@@ -274,7 +274,7 @@
       "functional": ["View events", "Search events", "Book tickets (reserve seat, then pay)"],
       "nonFunctional": ["Strong consistency for bookings (no double booking)", "Handle 10M users on popular events", "Read-heavy browsing"],
       "challenges": ["Seat reservation with TTL locks (Redis) or DB status+expiry", "Virtual waiting queue for surges", "Search with Elasticsearch, caching event pages"],
-      "concepts": ["distributed-lock", "ttl", "virtual-queue", "elasticsearch", "acid-transactions"]
+      "concepts": ["distributed-lock", "ttl", "virtual-queue", "elasticsearch", "acid-transactions", "acid-vs-base", "reliability-patterns", "security"]
     },
     {
       "id": "hotel-booking",
@@ -287,7 +287,7 @@
       "functional": ["Search listings by location & dates", "Reserve", "Cancel", "Host manages listings"],
       "nonFunctional": ["No double booking", "Search fast", "Handle overbooking policies"],
       "challenges": ["Inventory per date modeling", "Concurrency control (optimistic vs pessimistic locking)", "Idempotent reservation API"],
-      "concepts": ["acid-transactions", "optimistic-locking", "idempotency", "geohash"]
+      "concepts": ["acid-transactions", "optimistic-locking", "idempotency", "geohash", "acid-vs-base", "database-selection", "performance"]
     },
     {
       "id": "amazon-ecommerce",
@@ -300,7 +300,7 @@
       "functional": ["Browse/search products", "Cart", "Checkout & order", "Inventory management"],
       "nonFunctional": ["High availability for browsing", "Consistency for inventory/payments", "Flash-sale spikes"],
       "challenges": ["Inventory reservation", "Saga pattern for distributed checkout", "Search & catalog caching"],
-      "concepts": ["saga", "microservices", "elasticsearch", "idempotency"]
+      "concepts": ["saga", "microservices", "elasticsearch", "idempotency", "database-selection", "acid-vs-base", "sync-vs-async"]
     },
     {
       "id": "flash-sale",
@@ -313,7 +313,7 @@
       "functional": ["Purchase limited items", "Prevent overselling"],
       "nonFunctional": ["Handle 1M+ RPS bursts", "Fairness", "No oversell"],
       "challenges": ["Atomic decrement in Redis", "Request queueing / admission control", "Bot protection"],
-      "concepts": ["redis", "virtual-queue", "rate-limiting", "message-queue"]
+      "concepts": ["redis", "virtual-queue", "rate-limiting", "message-queue", "reliability-patterns", "acid-vs-base", "sync-vs-async"]
     },
     {
       "id": "online-auction",
@@ -326,7 +326,7 @@
       "functional": ["Post item for auction", "Place bids", "View current highest bid live"],
       "nonFunctional": ["Strong consistency on bids", "Real-time updates", "Fault tolerant: no lost bids"],
       "challenges": ["Concurrent bids (OCC / conditional writes)", "Pushing updates via SSE/pub-sub", "Auction end-time handling"],
-      "concepts": ["optimistic-locking", "sse", "pub-sub", "message-queue"]
+      "concepts": ["optimistic-locking", "sse", "pub-sub", "message-queue", "acid-vs-base", "database-selection", "high-availability"]
     },
     {
       "id": "payment-system",
@@ -339,7 +339,7 @@
       "functional": ["Merchants create payment intents", "Charge cards via PSPs", "Refunds", "Webhooks to merchants"],
       "nonFunctional": ["Correctness above all (no double charge)", "Auditability", "High availability"],
       "challenges": ["Idempotency keys", "Double-entry ledger", "Reconciliation with external PSPs", "Retry with exponential backoff"],
-      "concepts": ["idempotency", "acid-transactions", "ledger", "webhooks", "saga"]
+      "concepts": ["idempotency", "acid-transactions", "ledger", "webhooks", "saga", "acid-vs-base", "high-availability", "security"]
     },
     {
       "id": "digital-wallet",
@@ -352,7 +352,7 @@
       "functional": ["Check balance", "Transfer to another user", "Transaction history"],
       "nonFunctional": ["Strong consistency", "Auditability", "Exactly-once"],
       "challenges": ["Distributed transactions across shards (2PC vs saga)", "Event sourcing for balances", "Idempotency"],
-      "concepts": ["two-phase-commit", "saga", "event-sourcing", "ledger"]
+      "concepts": ["two-phase-commit", "saga", "event-sourcing", "ledger", "acid-vs-base", "high-availability", "security"]
     },
     {
       "id": "stock-exchange",
@@ -365,7 +365,7 @@
       "functional": ["Place/cancel orders", "Order matching", "Live price updates"],
       "nonFunctional": ["Ultra-low latency", "Deterministic ordering", "Fairness"],
       "challenges": ["Order book data structure", "Sequencer & single-threaded matching engine", "Market data fan-out"],
-      "concepts": ["order-book", "event-sourcing", "pub-sub", "websockets"]
+      "concepts": ["order-book", "event-sourcing", "pub-sub", "websockets", "acid-vs-base", "high-availability", "observability"]
     },
     {
       "id": "typeahead",
@@ -378,7 +378,7 @@
       "functional": ["Return top-k suggestions for prefix", "Update popularity over time"],
       "nonFunctional": ["<100ms per keystroke", "Highly available", "Scales to billions of queries"],
       "challenges": ["Trie with cached top-k per node", "Offline aggregation pipeline for popularity", "Sharding the trie, client-side debouncing"],
-      "concepts": ["trie", "caching", "batch-processing", "sharding"]
+      "concepts": ["trie", "caching", "batch-processing", "sharding", "performance", "cost-optimization", "high-availability"]
     },
     {
       "id": "web-crawler",
@@ -391,7 +391,7 @@
       "functional": ["Crawl from seed URLs", "Extract text & links", "Store content"],
       "nonFunctional": ["Politeness (robots.txt, per-domain rate limits)", "Fault tolerant", "Crawl 10B pages in days"],
       "challenges": ["URL frontier with prioritization", "Deduplication (URL & content hashing, Bloom filters)", "DNS caching, retries with DLQ"],
-      "concepts": ["message-queue", "bloom-filter", "rate-limiting", "blob-storage"]
+      "concepts": ["message-queue", "bloom-filter", "rate-limiting", "blob-storage", "reliability-patterns", "sync-vs-async", "security"]
     },
     {
       "id": "search-engine",
@@ -404,7 +404,7 @@
       "functional": ["Search by keyword", "Sort by recency/relevance", "New content searchable quickly"],
       "nonFunctional": ["Query <500ms", "Index freshness", "Massive scale"],
       "challenges": ["Inverted index design & sharding (by term vs document)", "Ranking", "Real-time indexing pipeline"],
-      "concepts": ["inverted-index", "sharding", "stream-processing", "caching"]
+      "concepts": ["inverted-index", "sharding", "stream-processing", "caching", "high-availability", "reliability-patterns", "cost-optimization"]
     },
     {
       "id": "recommendation-system",
@@ -417,7 +417,7 @@
       "functional": ["Personalized recommendations", "Incorporate recent activity"],
       "nonFunctional": ["Low latency serving", "Freshness", "Scale to millions of items"],
       "challenges": ["Candidate generation + ranking stages", "Feature store", "Offline training vs online serving"],
-      "concepts": ["feature-store", "batch-processing", "stream-processing", "vector-search"]
+      "concepts": ["feature-store", "batch-processing", "stream-processing", "vector-search", "performance", "cost-optimization", "reliability-patterns"]
     },
     {
       "id": "llm-chat",
@@ -430,7 +430,7 @@
       "functional": ["Send prompt, receive streamed response", "Conversation history", "Rate limits per tier"],
       "nonFunctional": ["Low time-to-first-token", "Efficient GPU utilization", "High availability"],
       "challenges": ["Streaming via SSE", "GPU scheduling & batching", "Conversation storage and context management"],
-      "concepts": ["sse", "rate-limiting", "load-balancing", "caching"]
+      "concepts": ["sse", "rate-limiting", "load-balancing", "caching", "cost-optimization", "performance", "reliability-patterns"]
     },
     {
       "id": "rag-system",
@@ -443,7 +443,7 @@
       "functional": ["Ingest documents", "Answer questions with citations"],
       "nonFunctional": ["Answer latency <3s", "Index freshness", "Access control on documents"],
       "challenges": ["Chunking & embedding pipeline", "Vector DB / ANN index", "Hybrid search and reranking"],
-      "concepts": ["vector-search", "batch-processing", "inverted-index", "caching"]
+      "concepts": ["vector-search", "batch-processing", "inverted-index", "caching", "security", "database-selection", "observability"]
     },
     {
       "id": "top-k",
@@ -456,7 +456,7 @@
       "functional": ["Top-K for last hour/day/month/all-time"],
       "nonFunctional": ["Results within minutes of events", "Massive event volume", "Low query latency"],
       "challenges": ["Count-Min Sketch vs exact counting", "Stream processing with windowed aggregation (Flink)", "Precomputing and caching results"],
-      "concepts": ["stream-processing", "count-min-sketch", "kafka", "heap"]
+      "concepts": ["stream-processing", "count-min-sketch", "kafka", "heap", "cost-optimization", "observability", "acid-vs-base"]
     },
     {
       "id": "ad-click-aggregator",
@@ -469,7 +469,7 @@
       "functional": ["Record click and redirect", "Query click metrics by time window"],
       "nonFunctional": ["No lost clicks; idempotent counting", "Near real-time (<1 min)", "10k+ clicks/sec peak"],
       "challenges": ["Kafka + Flink streaming aggregation", "Deduplication & click fraud", "Lambda/Kappa architecture with reconciliation", "OLAP store for queries"],
-      "concepts": ["kafka", "stream-processing", "idempotency", "olap"]
+      "concepts": ["kafka", "stream-processing", "idempotency", "olap", "acid-vs-base", "reliability-patterns", "high-availability", "schema-registry"]
     },
     {
       "id": "metrics-monitoring",
@@ -482,7 +482,7 @@
       "functional": ["Ingest metrics", "Query & dashboards", "Alerting rules"],
       "nonFunctional": ["High write throughput", "Efficient storage", "Timely alerts"],
       "challenges": ["Push vs pull collection", "Time-series DB compression & downsampling", "Alert evaluation at scale"],
-      "concepts": ["time-series-db", "kafka", "stream-processing", "downsampling"]
+      "concepts": ["time-series-db", "kafka", "stream-processing", "downsampling", "observability", "reliability-patterns", "high-availability"]
     },
     {
       "id": "logging-system",
@@ -495,7 +495,7 @@
       "functional": ["Ingest logs", "Search and filter", "Retention policies"],
       "nonFunctional": ["High ingest throughput", "Durable", "Search within seconds"],
       "challenges": ["Agent → Kafka → indexer pipeline", "Hot/warm/cold tiered storage", "Indexing cost"],
-      "concepts": ["kafka", "inverted-index", "blob-storage", "tiered-storage"]
+      "concepts": ["kafka", "inverted-index", "blob-storage", "tiered-storage", "cost-optimization", "database-selection", "reliability-patterns", "schema-registry"]
     },
     {
       "id": "unique-id-generator",
@@ -508,7 +508,7 @@
       "functional": ["Generate 64-bit unique IDs", "IDs roughly time-ordered"],
       "nonFunctional": ["High throughput", "No coordination bottleneck"],
       "challenges": ["Snowflake layout (timestamp/worker/sequence)", "Clock skew", "UUID vs ticket server trade-offs"],
-      "concepts": ["snowflake", "clock-sync"]
+      "concepts": ["snowflake", "clock-sync", "database-selection", "high-availability", "reliability-patterns"]
     },
     {
       "id": "job-scheduler",
@@ -521,7 +521,7 @@
       "functional": ["Schedule jobs (immediate, delayed, cron)", "Monitor job status", "Retries on failure"],
       "nonFunctional": ["Jobs run within seconds of scheduled time", "At-least-once execution", "10k+ jobs/sec"],
       "challenges": ["Two-layer: DB of schedules + time-bucketed queue", "Worker leasing & visibility timeouts", "Idempotent jobs"],
-      "concepts": ["message-queue", "leasing", "idempotency", "distributed-lock"]
+      "concepts": ["message-queue", "leasing", "idempotency", "distributed-lock", "reliability-patterns", "database-selection", "high-availability"]
     },
     {
       "id": "message-queue",
@@ -534,7 +534,7 @@
       "functional": ["Produce/consume messages", "Topics & partitions", "Consumer groups"],
       "nonFunctional": ["High throughput", "Durability", "Ordering per partition"],
       "challenges": ["Append-only log & segment files", "Replication & leader election (ISR)", "Offset management, delivery semantics"],
-      "concepts": ["kafka", "replication", "leader-election", "partitioning"]
+      "concepts": ["kafka", "replication", "leader-election", "partitioning", "high-availability", "reliability-patterns", "cost-optimization", "schema-registry"]
     },
     {
       "id": "api-gateway",
@@ -547,7 +547,7 @@
       "functional": ["Request routing", "Auth", "Rate limiting", "Health checks"],
       "nonFunctional": ["Minimal latency overhead", "Highly available"],
       "challenges": ["L4 vs L7 balancing", "Load balancing algorithms", "Config propagation"],
-      "concepts": ["load-balancing", "rate-limiting", "service-discovery"]
+      "concepts": ["load-balancing", "rate-limiting", "service-discovery", "reliability-patterns", "security", "observability"]
     },
     {
       "id": "cdn",
@@ -560,7 +560,7 @@
       "functional": ["Cache content at edge", "Invalidate content"],
       "nonFunctional": ["Low latency globally", "High availability"],
       "challenges": ["Request routing (DNS / anycast)", "Cache hierarchy", "Invalidation propagation"],
-      "concepts": ["cdn", "caching", "dns", "anycast"]
+      "concepts": ["cdn", "caching", "dns", "anycast", "cost-optimization", "security", "high-availability"]
     },
     {
       "id": "google-docs",
@@ -573,7 +573,7 @@
       "functional": ["Create/edit documents", "Concurrent real-time editing", "See others' cursors"],
       "nonFunctional": ["Eventual consistency (all converge)", "Low latency updates (<100ms)", "Durable edits"],
       "challenges": ["OT vs CRDTs", "WebSocket connections routed by doc", "Operation log + snapshots"],
-      "concepts": ["websockets", "crdt", "operational-transform", "event-sourcing", "consistent-hashing"]
+      "concepts": ["websockets", "crdt", "operational-transform", "event-sourcing", "consistent-hashing", "database-selection", "high-availability", "reliability-patterns"]
     },
     {
       "id": "leetcode",
@@ -586,7 +586,7 @@
       "functional": ["View problems", "Submit code and get results", "Live contest leaderboard"],
       "nonFunctional": ["Secure isolation of untrusted code", "Results within seconds", "Handle contest spikes"],
       "challenges": ["Sandboxing (containers, gVisor, Firecracker)", "Queue-based execution workers", "Leaderboard with Redis sorted sets"],
-      "concepts": ["sandboxing", "message-queue", "redis", "autoscaling"]
+      "concepts": ["sandboxing", "message-queue", "redis", "autoscaling", "reliability-patterns", "performance", "cost-optimization"]
     },
     {
       "id": "calendar",
@@ -599,7 +599,7 @@
       "functional": ["Create events & invite", "Recurring events", "Reminders", "Free/busy lookup"],
       "nonFunctional": ["Consistency for invites", "Timely reminders"],
       "challenges": ["Recurrence rule storage vs expansion", "Time zones", "Reminder scheduling"],
-      "concepts": ["job-scheduling", "data-modeling", "caching"]
+      "concepts": ["job-scheduling", "data-modeling", "caching", "sync-vs-async", "reliability-patterns", "observability"]
     },
     {
       "id": "leaderboard",
@@ -612,7 +612,7 @@
       "functional": ["Update score", "Get top N", "Get a player's rank and neighbors"],
       "nonFunctional": ["Real-time updates", "Low latency reads"],
       "challenges": ["Redis sorted sets", "Sharding a global leaderboard", "Ties and time windows"],
-      "concepts": ["redis", "sharding", "caching"]
+      "concepts": ["redis", "sharding", "caching", "database-selection", "reliability-patterns", "observability"]
     },
     {
       "id": "strava",
@@ -625,7 +625,7 @@
       "functional": ["Start/pause/stop activity with GPS tracking", "Share activities", "View friends' feed"],
       "nonFunctional": ["Works offline", "Accurate tracking", "Scale to millions of active users"],
       "challenges": ["Client-side buffering vs server streaming", "Storing GPS traces", "Leaderboards for segments"],
-      "concepts": ["offline-sync", "blob-storage", "fan-out"]
+      "concepts": ["offline-sync", "blob-storage", "fan-out", "database-selection", "sync-vs-async", "reliability-patterns"]
     }
   ]
 }

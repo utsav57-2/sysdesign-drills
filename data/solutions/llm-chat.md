@@ -220,6 +220,67 @@ The output length is unknown when the request starts, so:
 
 A separate **concurrency limit** (e.g. 3 simultaneous generations per free user) protects GPU slots from one user opening many streams.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Cassandra or DynamoDB for conversations and messages.** ~1 TB/day of new messages, ~5.8k writes/s plus a write for each finished assistant reply, and every read is a single partition (`user_id` for the sidebar, `conversation_id` for a thread). No cross-conversation joins or transactions are needed. Postgres was rejected because at ~365 TB/year it would need manual sharding, and we'd use none of its relational features. The trade-off: no ad hoc queries, so search runs on a separate index fed asynchronously.
+- **Postgres for users, tiers and orgs.** Small, relational, and changes to tier affect billing, so it needs ACID.
+- **Redis for quota buckets: BASE with a durable backstop.** If a Redis node loses a few seconds of counters, a user gets slightly more tokens than their limit for a minute. That's acceptable; invoices come from the Kafka usage pipeline, which dedupes on request ID. Billing is the one place that needs exactly-once *effect*.
+- **CAP stance:** the conversation store is **AP** with read-your-writes per session (write the user message at quorum, read at quorum in the same region). A user briefly not seeing a conversation on a second device is a minor annoyance; refusing to chat is not. The billing ledger is **CP**: delaying an invoice is better than miscounting it.
+
+### Service boundaries and communication
+
+- **Chat service** (SSE, prompt assembly, persistence), **inference router**, **GPU replicas**, and the **billing consumer**. The GPU tier is split out because it scales, deploys and fails on its own timeline (loading weights takes minutes) and is ~all of the cost. The context builder can live inside the chat service; making it a separate network hop adds latency to TTFT for no isolation gain.
+- **Synchronous:** quota check, saving the user message, loading history, and the router call. All are on the TTFT path, so each has a tight timeout.
+- **Streaming:** replica → chat service → client, buffered in a Redis stream so the client connection is decoupled from generation.
+- **Asynchronous:** usage events to Kafka, summary generation for long conversations, search indexing. None of them should add milliseconds to TTFT, and all can retry later.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| GPU replica dies mid-generation | Stream stops for up to ~390 in-flight sequences | Heartbeat **timeout**; retry on another replica if no tokens were shown, else mark failed with a regenerate button; charge only delivered tokens |
+| GPU pool saturated after a launch | Queue wait grows, TTFT blows past 1 s | **Admission control** and **load shedding** by tier: free tier gets 503 with `Retry-After` or a smaller model first, paid tier last |
+| Conversation store slow | Can't load history, TTFT stalls | **Timeout** of ~200 ms on history reads; **circuit breaker** opens and the chat service degrades to "can't load history" errors rather than tying up GPU slots with requests that will fail |
+| Redis quota store down | Can't enforce limits | **Fail open** for paid tiers with a conservative per-server local limit; **fail closed** for free tier and anonymous traffic, where abuse risk is highest |
+| Kafka billing consumer falls behind | Invoices delayed | Events are durable; consumer is idempotent on request ID; malformed events go to a **DLQ** for review |
+| One user floods long prompts | Their requests eat batch slots | Token-based buckets plus a per-user concurrency limit act as a **bulkhead** between users |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the router (run several stateless instances; the replica registry is rebuilt from heartbeats), Redis (replicated, with the fail-open/closed rule above), and per-model GPU pools in a single region. Spread each model's replicas across zones and several regions.
+- **Regions:** active-active. The chat service and conversation store run in each region; GPU capacity is a global pool and the router can send overflow to another region's GPUs. Cross-region inference adds a little TTFT but beats a 503.
+- **Targets:** conversation history **RPO under a minute** (async cross-region replication; losing the last turn in a region failure is tolerable, the user can re-ask), **RTO of a few minutes** via DNS failover. Billing events have **RPO ≈ 0** from replicated Kafka because they are money. Point-in-time backups of the conversation store protect against bad deploys and accidental deletes.
+
+### Security
+
+- **Authn/authz:** session tokens for the consumer app, API keys for the developer API, both resolved at the gateway to a user, org and tier. Every conversation read checks `user_id` ownership; org admins see only their org's data.
+- **Tenant isolation on GPUs:** prefix caching must be keyed per user or org (or limited to shared system prompts) so one user's cached context can't leak into another's response or reveal itself through timing.
+- **Encryption:** TLS end to end; conversations encrypted at rest. Conversations are the most sensitive data here (health, legal, code), so enterprise orgs may get per-tenant keys in a KMS with rotation, and staff access to message content goes through a logged break-glass path written to an **audit log**.
+- **Secrets:** API keys are stored hashed; users can rotate and revoke them. Internal service credentials rotate automatically.
+- **PII and retention:** honor user deletion across the store, search index, Redis stream buffers and backups (deleted from backups when they age out). Don't log prompt text by default.
+- **Abuse:** token and concurrency limits per tier, signup throttling, and a safety classifier on inputs and outputs to catch misuse; API keys leaked in public code should be detectable and revoked.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 99% of interactive requests get their first token within 2 s; p50 under 1 s.
+- 99% of streams sustain at least 20 tokens/s after the first token.
+- 99.9% of accepted requests finish with `end_turn`, `max_tokens` or a user stop, not an error.
+
+**Metrics:** TTFT split into queue wait vs prefill, tokens/s per replica, batch size and KV cache utilization, prefix cache hit rate, 429 and 503 rates per tier, GPU utilization per pool.
+
+**Tracing:** one trace per message across gateway → quota → store → router → replica → stream end, with queue wait as its own span. This is how you tell "GPUs are full" from "history load was slow".
+
+**Paging:** fast and slow SLO burn-rate alerts on TTFT and error rate, per model and region. GPU utilization dropping is a cost signal, not a page.
+
+### Performance and cost
+
+- **Main bottleneck:** KV cache memory per replica (~1.5M tokens) caps batch size. Levers: continuous batching, PagedAttention, prefix caching and lower default max output length, all covered above. Quantizing the KV cache or weights to 8-bit fits more sequences per GPU, at some quality risk that needs evaluation.
+- **GPUs are the cost.** ~1,450 replicas × 8 = ~11,600 GPUs on average, ~24,000 at peak. At an assumed $2 per GPU-hour, average load alone is ~$23k/hour, ~$560k/day. Levers: route simple prompts to a smaller model (cheaper, sometimes worse answers); run batch API jobs off-peak on idle capacity (slower for those users); keep a smaller warm spare pool (slower recovery from spikes). A 5% gain in tokens/s per replica saves ~70 replicas.
+- **Storage:** 1 TB/day × replication factor 3 ≈ 3 TB/day raw, ~1.1 PB/year. Compress message bodies (text compresses well) and tier conversations untouched for months to object storage; the trade-off is slower reopening of old chats.
+
 ## Follow-up questions
 
 ### How do you reduce time to first token?

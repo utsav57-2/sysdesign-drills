@@ -224,6 +224,71 @@ Different parts of the system update on different clocks:
 
 **Cold start:** new users get popular and trending items for their region and device, then exploration based on the first few clicks (the user tower works from those immediately). New items get embeddings from content features via the item tower, plus a small exploration boost so they collect enough interactions to be judged.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres for users and the item catalog.** Small, relational, and the source of truth for account state, availability and policy takedowns. ACID matters because a removed item must stay removed; everything downstream is a derived copy.
+- **Key-value online feature store (Redis, Cassandra or DynamoDB).** The access pattern is "give me 50 features for these 500 keys in under 10 ms". There are no joins and no transactions, so a relational store adds nothing. BASE is fine: if a session counter is off by one or a replica is 2 s behind, a slightly worse list is served, which nobody notices. Choose AP: a partitioned replica keeps answering with stale values rather than failing the page.
+- **In-memory ANN index** rather than a vector database used as the primary store. At 5.1 GB the index fits on every retrieval node, so each node answers locally and scales by adding replicas. Embeddings are rebuilt from the model registry, so the index is never the source of truth.
+- **The one strongly consistent decision is model/index versioning.** The registry pointer that says "serve ranker v8 with ANN index v8" must flip atomically (CP), because a v8 user vector against v7 item vectors gives garbage. Serving pins a version per request and keeps both versions loaded during a rollout.
+
+### Service boundaries and communication
+
+- **Rec service** orchestrates the request. **Candidate generation** and the **ranking service** are separate because they have different hardware and scaling curves: retrieval is memory-bound (the ANN index), ranking is compute-bound (GPU or large CPU pools). Re-ranking stays in-process in the rec service. It takes ~5 ms of rules, so a network hop would cost more than the work.
+- **Event ingestion** (`POST /events`, 58k/s) is a thin separate service writing to Kafka, so it stays up when ranking is down.
+- **Synchronous:** client → rec service → feature store, ANN, ranker. These calls sit inside the 200 ms budget and need answers now.
+- **Asynchronous:** events → Kafka → stream processor → online store; batch features, training and index rebuilds → registry → serving nodes pull new versions. None of these should ever block a page load.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Ranker pool overloaded or slow | p99 blows past 200 ms | Hard ~80 ms timeout, then return candidates in retrieval order; circuit breaker skips the ranker while its error rate is high; shed load by cutting candidates from 500 to 200 under pressure |
+| One feature store partition slow | Every request touching it waits | ~10 ms deadline per batched lookup with a hedged read to another replica; missing features fall back to training-time defaults |
+| Stream processor lag | Session freshness lost; recs drift back to long-term taste | Recs are still served; Kafka keeps 7 days so the job catches up by replay; alert on lag, not on CPU |
+| Bad model or mismatched index pushed | Quality drops silently, or retrieval returns nonsense | Versioned model/index pairs, canary on 1% of traffic with automatic rollback on CTR or watch-time guardrails |
+| Rec service fully down | Empty home page | Client and CDN hold the regional trending list as the last-resort fallback |
+| Client retries `POST /events` | Duplicate events inflate counts | Client-generated event IDs; stream job dedupes within a short window, so the retry is idempotent |
+
+The ranker and retrieval use separate thread and connection pools (bulkheads), so a slow ranker cannot starve the trending fallback path.
+
+### High availability and disaster recovery
+
+- **No stateful SPOF on the serving path.** Rec and ranking services are stateless across three zones. Every retrieval node holds the full 5.1 GB index, so losing a node or a zone only removes capacity. The feature store runs with replication factor 3 across zones.
+- **Multi-region active-active for serving**, because users are global and the 200 ms budget doesn't allow cross-ocean calls. Each region has its own feature store fed by its own stream job. Training stays in one region, and models and indexes are copied out through the registry.
+- **RPO/RTO by data:** users and catalog (Postgres, synchronous standby): RPO ≈ 0, RTO under 5 minutes. A lost takedown is a policy problem. Online features: RPO of minutes is fine, because they are rebuilt by replaying Kafka plus the last batch snapshot. Events: losing seconds is acceptable, which the 202 API already assumes. The model registry is the real crown jewel: versioned in object storage with cross-region copies, so a bad push is rolled back in minutes. Serving RTO: under 1 minute to the trending fallback, which is always available.
+
+### Security
+
+- **Authn/authz:** the user comes from the auth token at the gateway; services call each other over mTLS. Only the rec service can read user features.
+- **Viewing history is sensitive PII.** Use pseudonymous IDs in the lake, encrypt at rest with KMS envelope keys (rotation re-wraps keys, not petabytes), and audit-log all raw-event access. Deletion requests must reach Postgres, the online store, user embeddings and training sets.
+- **Abuse:** fake watches and clicks to boost an item are the main attack. Rate-limit `/events` per user and device, accept only events whose `requestId` was actually served to that user, and down-weight accounts with bot-like patterns in training.
+- **Audit** changes to re-ranking business rules and model promotions. They change what 100M people see.
+
+### Observability
+
+- **SLIs and SLOs (30-day windows):**
+  - 99.95% of rec requests return a non-empty list (fallback counts as success).
+  - 99% of requests complete within 200 ms.
+  - 99% of interaction events are reflected in online features within 5 s.
+  - Under 1% of responses are served from a fallback (degraded) path.
+- **Dashboards:** stage latencies, candidates per source, feature-missing rate, stream lag, CTR and watch time by model version.
+- **Traces:** one span per retrieval source, per feature batch and per ranker call, tagged with `model_version` and `requestId` so a bad list can be replayed.
+- **Paging:** fast and slow burn-rate alerts on the availability and latency SLOs, plus the freshness SLI. A sudden quality drop after a rollout pages the model owner. Node CPU or a single replica failing does not page.
+
+### Performance and cost
+
+**Bottleneck:** ranking (~5.8M scorings/s average, ~17.5M/s at the 35k/s peak) and the feature fetch feeding it. Levers:
+- Batch all ~500 candidates into one GPU call.
+- Cache item features in-process. They are shared across users: 10M items × 50 features × 4 bytes ≈ 2 GB. Then the online store serves mostly user features.
+- Quantize the ANN index to int8 (5.1 GB → ~1.3 GB) for more replicas per box, at a small recall cost.
+
+**Cost drivers:**
+- **Ranking compute** is the largest. Trimming candidates from 500 to 300 cuts it ~40%, at some risk to recall. Caching the ranked list for a few minutes per user saves repeat refreshes but loses session freshness.
+- **Logged features.** Logging 50 features for all 500 candidates is ~100 KB/request, or ~100 TB/day. Log only the 20 shown items (~4 KB/request, ~4 TB/day) and sample the rest. The trade-off is less data for training the ranker on unshown items.
+- **Data lake growth:** 1 TB/day of events is ~365 TB/year before replication. Keep raw events for 90 days and downsampled, aggregated data after that. Older retraining experiments become impossible.
+
 ## Follow-up questions
 
 ### How do you avoid a feedback loop where the system only shows what it already shows?

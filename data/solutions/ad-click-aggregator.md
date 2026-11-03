@@ -200,6 +200,73 @@ GROUP BY hour ORDER BY hour;
 
 `ORDER BY (ad_id, minute, ...)` makes all rows for one ad contiguous on disk, so the query reads a narrow range. For long ranges, materialized views maintain hourly and daily rollups, so a one-year daily chart reads 365 rows per dimension combination instead of 525,600 minute rows. `FINAL` forces deduplication of upserted rows at read time; for very hot dashboards, query rollups that are merged in the background instead.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres for ads and advertisers.** Ownership (`ad_id` → `advertiser_id`) drives authorization and billing, so it needs ACID and foreign keys. It's tiny, and the click service only reads it through an in-memory cache.
+- **Kafka as the system of record for clicks:** replayable, ordered, durable appends; a database would add nothing at 10k writes/s.
+- **Columnar OLAP for aggregates**, for the reasons in the deep dive. Its writes are idempotent upserts rather than transactions; the only atomic operation needed is the nightly **partition replace**, so readers see either the old day or the reconciled day, never a mix.
+- **Consistency per path:** click capture is **AP**: always redirect and buffer locally, because a failed redirect loses the advertiser's visitor. Dashboards are **eventually consistent** (~70 s, then corrected by late re-fires and the nightly batch). Billing is effectively **CP**: it reads only reconciled partitions, and if reconciliation fails, invoicing waits rather than bill on unverified numbers.
+
+### Service boundaries and communication
+
+- **Click service** is public, unauthenticated, stateless and latency-critical. **Query service** is authenticated, read-heavy and tolerant of a second of latency. Splitting them keeps different SLOs, scaling and attack surfaces apart.
+- **Don't split further:** dedup, fraud rules and windowing stay in one Flink job. A separate dedup service called per click would add a network hop and a second state store to keep consistent.
+- **Sync vs async:** the only synchronous dependency on the click path is the Kafka produce, with a ~20 ms timeout inside the 50 ms budget, then the disk-buffer fallback. Ad lookups come from a cache refreshed in the background, never a per-click DB call. Everything downstream of Kafka is async.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Kafka slow or unreachable | Produce latency threatens the 50 ms redirect | 20 ms timeout, then local WAL (follow-up); a circuit breaker skips Kafka while it's open so every click doesn't wait out the timeout |
+| Flink task crash or failed checkpoints | Dashboards stall; lag grows | Restore from the last checkpoint; Kafka holds 7 days; alert on checkpoint age and consumer lag |
+| OLAP store down | Sink backpressures Flink; dashboards fail | Flink buffers via Kafka lag; query service serves cached results with a "data as of" note (graceful degradation) |
+| Bot flood (10× peak of forged or replayed URLs) | Click service and Flink overloaded, inflated counts | HMAC rejects forged tokens before producing; per-IP rate limits at the edge; dedup and fraud rules drop replays; shed recording, never the redirect |
+| Hot ad | One Flink task lags | Salted key with a second aggregation stage (follow-up) |
+| Bad deploy changes counts | Wrong numbers reach billing | Reconciliation diff over 0.1% blocks the partition swap and pages; replay from Kafka or S3 after the fix |
+
+### High availability and disaster recovery
+
+- **SPOFs:** click service in at least 2 regions behind latency-based DNS with health checks; each region runs its own Kafka (RF 3 across zones) and Flink job. Flink runs with HA for its job manager and checkpoints to object storage. Postgres runs with a standby.
+- **Multi-region aggregation:** include `region` in the OLAP key so each region's Flink upserts its own rows and queries sum them. Rare cross-region duplicate clicks on the same impression are removed by the nightly global dedup.
+- **Why multi-region for clicks:** at average load, a 10-minute regional outage is ~700k clicks (1,160/s × 600 s), which is direct lost revenue. Dashboards don't justify that, but the redirect does.
+- **Targets:** redirect **RTO under 1 minute** (DNS failover). Acked clicks **RPO 0** for zone loss. For region loss, **RPO equals the async mirror lag of that region's Kafka (target under 1 minute)** plus any undrained click-host buffers. Dashboards **RTO 15 minutes**. Billing **RTO is hours**, since it runs nightly.
+- **Backups:** S3 raw data is the real backup: versioned, replicated cross-region, with object lock for the billing-dispute period. The OLAP store can be rebuilt from it. Postgres uses PITR.
+
+### Security
+
+- **Click tokens:** HMAC with a key ID in the token; accept the current and previous key during rotation, and keep keys in a secrets manager or KMS.
+- **Open redirects:** only ever redirect to the ad's stored `target_url`, never to a URL in the request.
+- **Advertiser API:** OAuth tokens; the query service always adds `advertiser_id` to the predicate, so isolation doesn't depend on the client.
+- **PII:** IP, user agent and `user_id` exist only in Kafka and raw S3. Pseudonymize `user_id` with a keyed hash, truncate IPs after the fraud-analysis window, and keep aggregates PII-free. Encrypt buckets and disks; use TLS everywhere.
+- **Audit:** log access to raw click data, reconciliation overrides, and any manual credit to advertisers, since these affect money.
+- **Abuse:** fraud rules (deep dive) plus per-advertiser query rate limits.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.95% of valid clicks redirected within 50 ms server-side.
+- 99% of minute buckets visible in dashboards within 90 s of the minute ending.
+- Daily stream vs reconciled totals within 0.1% for every advertiser above a spend threshold.
+- 99% of dashboard queries within 1 s.
+
+**Metrics:** the per-stage counts from the "no clicks lost" follow-up, the duplicate and fraud drop rates, late side-output volume, Flink checkpoint duration, and the click hosts' disk-buffer depth.
+
+**Tracing:** sample click requests; for the stream, stage counters beat per-event traces.
+
+**Paging:** redirect error or latency burn rate, freshness burn, and a blocked reconciliation. A spike in the duplicate rate is a ticket (it may be a bot campaign or a client bug).
+
+### Performance and cost
+
+**Bottleneck:** redirect latency, not throughput (5 MB/s is small). Keep producer `linger.ms` at a few ms, which trades a little batching efficiency for latency, and use persistent pooled connections. In the OLAP store, the `(ad_id, minute)` sort key and rollups keep queries narrow. Avoid `FINAL` on hot dashboards by reading background-merged rollups.
+
+**Cost drivers:**
+- **Raw archive, ~18 TB/year growing without bound.** Move Parquet to infrequent-access storage after 90 days and delete after the contractual dispute window. The trade-off is that older reprocessing becomes slower and costs retrieval fees.
+- **OLAP minute rows.** Keep minute granularity for ~30 days and hour/day rollups for years. Advertisers lose minute detail on old campaigns.
+- **Kafka and mirroring** (1 TB, ~50 GB/day) are small.
+- **The real cost risk is incorrect billing**, not infrastructure. Reconciliation and the duplicate Spark logic are worth their operational cost; this is the wrong place to economize.
+
 ## Follow-up questions
 
 ### What happens if Kafka is down when a click arrives?

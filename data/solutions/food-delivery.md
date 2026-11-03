@@ -268,6 +268,63 @@ The search checks the cell containing the point plus its neighbors, so couriers 
 - Dispatch is partitioned by city, so a storm in one city doesn't slow others. When couriers are scarce, quoted ETAs rise, delivery radius shrinks, and peak pay attracts more couriers.
 - Restaurants can be auto-paused when their open-order queue exceeds what their kitchen can handle.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Orders, order events, outbox, courier status: Postgres (ACID).** The follow-up below covers why and how it's sharded. The core reason is that the guarded transition, the event row and the outbox row must commit together; a NoSQL store with single-item atomicity would force us to rebuild that and risk "status changed but dispatch never heard". At ~210 orders/s peak, relational throughput is not a constraint.
+- **Courier locations: Redis GEO (BASE).** 100k overwrites/s of data that is stale in 5 s anyway. Losing a node loses nothing that the next ping won't restore, so durability and transactions would be wasted cost. A relational table with a spatial index was rejected because 100k updates/s would churn the index and WAL for no benefit.
+- **Restaurant search: Elasticsearch, derived from Postgres.** Eventually consistent is fine: a restaurant that closed 30 s ago still showing up is caught at order time, when the order service re-checks `is_open` and item availability against Postgres.
+- **CAP stance:** order placement and transitions are **CP**. If an order shard's primary is unavailable we fail the order rather than risk a double charge or two couriers. Browsing, menus and tracking are **AP**: serve slightly stale data rather than an error, because an empty restaurant list at dinner loses revenue for every restaurant at once.
+
+### Service boundaries and communication
+
+- **Discovery** (read-heavy, cacheable), **Order** (the state machine and payments), **Dispatch** (CPU-heavy batch solving per city), **Location** (100k writes/s), **Realtime gateway** (~1M long-lived connections) and **ETA/routing**. Each split follows a different scaling profile and failure tolerance: browsing must survive a dispatch outage, and a WebSocket deploy must not restart the order service.
+- **Synchronous:** order → payment authorization (the customer must know if the card was declined); restaurant accept/reject and courier offer accept (an immediate 200 or 409); dispatch → ETA service, with a strict timeout.
+- **Asynchronous:** order transitions → outbox → Kafka → dispatch, realtime gateway, notifications, analytics; courier positions → pub/sub → customer. These tolerate seconds of lag, and Kafka absorbs a dispatch restart.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Payment provider slow or down | Orders hang at checkout; threads pile up | 3–5 s timeout, retries with backoff + jitter using the order ID as idempotency key, circuit breaker that shows "payments delayed, try again" rather than tying up order-service threads |
+| ETA/routing service slow | Dispatch batch misses its 30 s window | Per-call timeout and a bulkhead (separate pool) for routing calls; fall back to straight-line distance × city speed factor for that batch |
+| Dispatch for one city crashes | Orders in that city wait for couriers | Dispatch partitioned by city, restarted from Kafka offsets; other cities unaffected; alert when "confirmed but unassigned" age grows |
+| Malformed or unprocessable order event | Consumer blocks a Kafka partition, and that city stalls | Bounded retries, then dead-letter queue with an alert; consumers dedupe on `(order_id, version)` so replay is safe |
+| Dinner spike or rain in one city | Order and location load jumps 3–5× | Per-city admission control and load shedding of non-essential work (recommendations, analytics consumers) before order placement; widen ETAs and shrink delivery radius |
+
+### High availability and disaster recovery
+
+- **SPOFs:** order shard primaries, the Kafka cluster, the outbox relay and the per-city dispatcher. Postgres shards run a synchronous standby in another zone; Kafka uses replication factor 3 across zones with `min.insync.replicas=2`; relay and dispatcher run as leader-elected pairs so a standby takes over the partition.
+- **Zone vs region:** deploy multi-zone in each geographic region and keep a city's data in its home region (cities are naturally independent). A full region loss fails cities over to a warm standby region with async-replicated order data.
+- **RPO/RTO:** orders **RPO 0** within a region (a lost order means food was paid for and never cooked) and **≤ 1 minute** cross-region; **RTO ≤ 5 minutes** in-region and **≤ 30 minutes** for region failover. Courier locations need no backup: RPO is irrelevant because they refresh every 5 s.
+- **Backups:** snapshots plus WAL archiving for orders, with restore drills; Elasticsearch and caches are rebuilt from Postgres.
+
+### Security
+
+- **Authn:** separate token audiences for customers, restaurant tablets and couriers, so a stolen courier token can't call restaurant endpoints. **Authz:** every order endpoint checks the caller is that order's customer, restaurant or assigned courier.
+- **PII:** delivery addresses, phone numbers and live courier location. Show customers only the courier's first name and proxy phone calls through masked numbers; stop publishing courier location to the customer after delivery; retain raw location history only briefly and coarsen it for analytics.
+- **Payments:** card data stays with the provider (we hold tokens and `payment_intent_id`), keeping most systems out of PCI scope.
+- **Encryption, secrets, audit:** TLS everywhere, encryption at rest for orders and addresses, provider API keys in a secret manager with scheduled rotation. `order_events` already records actor and time per transition; add support-agent refunds to it.
+- **Abuse:** rate limits on orders and promos per customer and device, and GPS-spoofing checks on courier pings (impossible speeds).
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of order placements succeed within 2 s (excluding declined cards).
+  - 99% of status and location updates reach the customer within 2 s, matching the requirement.
+  - 95% of confirmed orders have a courier assigned before the food is ready.
+- **Dashboards per city:** orders/min, unassigned order age, offer decline rate, courier supply vs demand, Kafka lag, WebSocket count.
+- **Traces:** checkout (gateway → order → payment → DB → outbox relay) and the dispatch batch (candidates, ETA calls, solve, offers).
+- **Paging:** burn-rate alerts on the placement and assignment SLOs, per city, so a single-city outage pages even when the global number looks fine. Kafka lag or a CPU spike alone is a dashboard signal, not a page.
+
+### Performance and cost
+
+- **Bottleneck:** the location path at 100k writes/s and the fan-out to ~500k tracking sessions. Keep it in memory, shard Redis by city, and only publish to pub/sub for couriers on a delivery. Batching courier pings (send every 5 s, or less often when stationary) is the main knob: halving the rate halves writes but makes the map marker jumpier.
+- **Realtime connections:** ~1M concurrent sockets (500k customers plus 500k couriers) are a fixed fleet cost; customers who background the app can drop to push notifications.
+- **Dispatch compute:** O(n³) solves per city every 30 s; split dense cities into zones to keep n small, at a slight loss of optimality.
+- **Storage is cheap:** orders grow ~3.65 TB/year; archive orders older than a few months. Courier location history at 100k points/s × ~50 bytes is ~18 GB per peak hour, so sample it before storing. The 25 GB of menus fit in one replicated Redis cluster, a small fixed cost that keeps dinner-peak reads off Postgres.
+
 ## Follow-up questions
 
 ### What happens if the restaurant never responds to a new order?

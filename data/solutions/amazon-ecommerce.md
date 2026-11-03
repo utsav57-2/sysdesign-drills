@@ -218,6 +218,71 @@ Authorizing at checkout and **capturing** at shipment is deliberate: if an item 
 
 Dual writes (app writes the DB, then Elasticsearch) lose updates when the second write fails. Instead, **change data capture** reads the database's replication log (Debezium on the Postgres WAL or a DynamoDB stream), publishes each row change to Kafka keyed by `product_id`, and an indexer applies it to Elasticsearch with the product's version as the external version, so an older event arriving late can't overwrite newer data. Elasticsearch handles full-text relevance (BM25), filters and facets via aggregations; results are re-ranked by sales and conversion signals. The index lags the DB by a second or two, which is acceptable for browsing.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Catalog (DynamoDB/MongoDB): BASE, AP.** Category-specific attributes fit a document model (relational would need sparse columns or an entity-attribute-value table), and 5 TB keyed by `product_id` shards easily. A stale price on a page is fine because checkout reprices.
+- **Search (Elasticsearch): derived, AP.** A projection rebuilt from CDC; a second or two of lag is fine.
+- **Cart (key-value): AP.** This is the textbook Dynamo case: a failed add-to-cart loses a sale, while a rare merge conflict is settled by taking the union of items.
+- **Inventory, orders, payments (Postgres): ACID, CP.** The conditional update, the unique `idempotency_key` index and the `CHECK (available >= 0)` constraint all depend on single-database transactions. During a partition they return errors: a minute of unavailable checkout is cheaper than overselling (cancellations, lost trust) or double charging (chargebacks).
+- **Rejected:** one distributed SQL database for everything. The payment provider is external, so a saga is needed anyway, and catalog reads would pay for consistency they don't need.
+- **Order events need the outbox pattern.** If the Kafka publish fails after the order commits, fulfillment never hears of it. Write an `outbox` row in the same transaction and let a relay (or CDC, as with the catalog) publish it.
+
+### Service boundaries and communication
+
+- **Split by consistency and load profile.** Catalog, search and cart serve ~100k page views/s and can be stale; inventory, order and payment handle ~1,200 orders/s at peak and must be exact.
+- **Payment is its own service and network segment** so PCI scope stays small: only it talks to the provider.
+- **Synchronous:** gateway → catalog, search, cart; orchestrator → inventory and payment, because the user is waiting on a 2 s checkout and needs a 409 for out-of-stock.
+- **Asynchronous:** order events → fulfillment and email, CDC → indexer, inventory events → cached stock status.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Elasticsearch degraded | Search slows past 300 ms | Per-call timeout, circuit breaker, serve cached popular queries and fall back to category browsing from the catalog (graceful degradation) |
+| Inventory shard slow or down | Checkout fails for SKUs on that shard only | Sharding by `sku_id` limits the blast radius; per-shard connection pools as bulkheads; return "try again shortly" rather than queueing the user |
+| Fulfillment can't process an order event (poison message) | Order confirmed but never ships | Retry with backoff, then dead-letter topic with an alert; replay after the fix. Consumers are idempotent on `order_id` |
+| Reservation sweeper stops | Abandoned reservations hold stock; product shows "out" while units sit unsold | Alert on the age of the oldest active-but-expired reservation; sweeper is idempotent so two instances are safe |
+| Payment provider slow | Checkouts pile up in step 3 | Timeout plus retry with the same idempotency key, `payment_unknown` reconciliation (follow-ups); route to a secondary provider if the breaker opens |
+| Redis stock counter drifts from Postgres | Sold out shown early, or doomed requests admitted | Postgres decides; reconcile the counter from the DB every few seconds during sales |
+
+### High availability and disaster recovery
+
+- **Within a region:** each Postgres shard has a synchronous standby in another AZ and automated failover (~30–60 s), so acknowledged orders and payments have **RPO 0**.
+- **Across regions, browse is active-active:** catalog, search and caches replicate asynchronously and DNS sends users to the nearest healthy region. **RTO: minutes; RPO: seconds of catalog edits**, which sellers can redo.
+- **Checkout is homed, not active-active.** Accepting reservations for the same SKU in two regions would oversell. Each SKU's inventory lives in the region of its warehouses, and each user's orders in their home region, with async replicas elsewhere. Region failover promotes those replicas: **RTO ~15 minutes, RPO under a minute.** Why bother: at the 1,200 orders/s peak, one minute down is ~72k orders; at the 116/s average, ~7k.
+- **Backups:** nightly snapshots plus continuous WAL archiving for point-in-time recovery, since a bad migration or buggy sweeper replicates faithfully. Elasticsearch is rebuildable from the product DB, but reindexing 500M documents takes hours, so snapshot it too.
+
+### Security
+
+- **AuthN/AuthZ:** customers authenticate at the gateway; every order read checks the token's `user_id` against the order's, so guessing `orderId 901` returns 404. `PATCH /inventory` is allowed only for the seller who owns the SKU or staff scoped to that `warehouse_id`.
+- **Payment data:** the client sends a provider token (`paymentMethodToken`), never a card number, so card data doesn't touch our databases. Provider API keys live in a secrets manager, rotated with an overlap period.
+- **Encryption:** TLS everywhere, mTLS between services; KMS-managed encryption at rest for orders, carts and backups, which hold addresses and purchase history.
+- **PII:** addresses and order history are personal data. On a deletion request, anonymize the customer fields on orders rather than deleting the order, since financial records must be kept.
+- **Audit:** every inventory adjustment (who, delta, reason), price change, refund and staff access to customer orders.
+- **Abuse beyond bots (follow-ups):** credential stuffing (login rate limits, new-device challenges), card testing (velocity limits on authorizations per card and account), and promo-code abuse (per-account redemption limits).
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.99% of product page requests succeed, and 99% are served within 200 ms.
+- 99.95% of checkouts reach a terminal state within 2 s (declines and genuine out-of-stock count as successes).
+- Zero oversells: daily reconciliation that `reserved` equals the sum of active reservations per SKU.
+
+**Dashboards:** orders per minute against the same time last week (the best single symptom), saga states including stuck `payment_unknown`, PSP latency and error rate per provider, CDC lag to Elasticsearch, cache hit ratio, Redis-vs-DB stock drift during sales. **Tracing:** trace each checkout end to end with `order_id` as an attribute, and keep every slow or failed one (tail sampling). **Paging:** checkout and page SLO burn rates, and orders per minute dropping well below baseline.
+
+### Performance and cost
+
+**Bottlenecks:** the hot SKU row (handled in the deep dive) and database connections. Hundreds of service pods times many shards will exhaust Postgres connection slots, so use a connection pooler per shard. Index for the real queries: `(user_id, created_at)` on orders for "my orders", and a partial index on reservations `WHERE status = 'active'` on `expires_at` so the sweeper scans only live rows. The indexer uses bulk writes to Elasticsearch.
+
+**Cost drivers:**
+- **Browse traffic (~100k views/s peak):** cache hit ratio is the main lever. At 95% hits, the catalog DB sees ~5k reads/s instead of 100k.
+- **Images and CDN egress:** usually the largest bandwidth bill. Serve resized, modern-format images per device; the trade-off is CPU and storage for the variants.
+- **Search cluster:** a full copy of the 5 TB catalog plus replicas on SSD. Index only searchable fields and fetch display data from the catalog, at the cost of an extra lookup per result page.
+- **Order storage growth:** ~7.3 TB/year on replicated Postgres. Move orders older than 1–2 years to object storage, accepting slower access to old history.
+- **Operational complexity:** eight services, two Kafka flows and a saga engine; a managed workflow engine trades money for less hand-rolled state.
+
 ## Follow-up questions
 
 ### Where do you store the cart, and what happens for guest users?

@@ -220,6 +220,67 @@ Separate a **control plane** (stores config, validates it, computes snapshots) f
 
 If the control plane goes down, nodes keep serving the last good snapshot; only changes stop. That's the key availability property: the control plane is not on the request path.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Config DB (routes, clusters, rules): relational, ACID, CP.** A change usually touches several rows at once: a new route, the cluster it points at, its rate-limit rule. They must commit together as one version, or a node could receive a route pointing at a cluster that doesn't exist. Postgres gives transactions, foreign keys for that validation, and queryable version history; etcd would fit 10 MB and has watches, but is weaker for "who changed what". During a partition the control plane should **reject** admin writes rather than fork the config; operators can wait, traffic isn't affected.
+- **Rate-limit counters (Redis): BASE, AP.** Losing a shard resets some buckets, which means a few seconds of over-admission. Acceptable; blocking traffic because the limiter is unreachable isn't, hence fail-open (deep dive).
+- **Endpoints from service discovery: eventually consistent.** Endpoint lists lag pod changes by a few seconds; passive outlier detection covers the gap.
+- **Access logs** never touch a database on the request path. Nodes buffer them locally and ship them to a log pipeline (a Kafka topic, then object storage and a search index).
+
+### Service boundaries and communication
+
+- **L4 tier, L7 gateway fleet, control plane, Redis, identity provider, log pipeline.** Split by failure domain and change rate.
+- **Keep the gateway thin.** No business logic: every line of gateway code runs for all 500 services, so a bug there is a company-wide outage.
+- **Synchronous:** client → gateway → backend, and the Redis token check (with a ~2 ms timeout so it can't eat the 5 ms budget). **Asynchronous:** config pushes over xDS streams, JWKS refresh, deny-list updates, and log and metric shipping.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Redis shard slow or down | Rate-limit checks blow the latency budget | ~2 ms timeout, fail open to a per-node local limiter, circuit breaker stops calling Redis until it recovers |
+| One backend service is slow | Requests pile up and hold gateway memory and connections | Per-route timeouts; **bulkheads**: separate connection pools and pending-request caps per cluster, so one slow service can't starve the other 499; circuit breaker returns 503 fast |
+| Bad config pushed | Routes 404 or misroute everywhere | Validation before storing, node-side NACK, canary group first, automatic rollback if the canary's error rate rises |
+| Identity provider / JWKS down | Can't fetch new keys | Keep using cached keys; existing tokens verify until `exp`. Only new logins fail, which is the IdP's outage, not the gateway's |
+| Zone loss | A third of gateway capacity gone | Size so two zones carry peak: 40 surviving nodes at 25k req/s each, inside the 20k–50k per-node range |
+| Traffic spike or retry storm | Backends and gateway overload | Retry budgets (follow-ups), priority-based load shedding, 429 with `Retry-After` so well-behaved clients back off with jitter |
+
+### High availability and disaster recovery
+
+- **SPOFs removed:** the L4 tier is redundant via ECMP; L7 nodes are stateless and spread across 3 zones; the control plane is off the request path, so its outage only freezes changes.
+- **Every node is a config backup.** Each holds the full 10 MB snapshot, and versions are immutable in the config DB (synchronously replicated, with point-in-time recovery). Config **RPO ≈ 0**; also export each version to object storage so a bad DB migration can't destroy history.
+- **Region:** run active-active in at least two regions behind anycast or latency-based DNS. Withdrawing an anycast route shifts traffic in seconds; DNS failover takes about the TTL (keep it around 60 s).
+- **RTO targets from the budget:** 99.99% allows 53 minutes a year, so a zone loss must cause **zero** downtime and a region failover must complete in under ~5 minutes. Rate-limit state has no RPO; it rebuilds itself within a window.
+
+### Security
+
+- **TLS at the edge:** certificates for every public hostname, private keys in a secrets manager or HSM, renewed automatically well before expiry.
+- **Gateway → backend mTLS.** Stripping client-supplied `X-User-Id` only matters if backends accept traffic *only* from the gateway. mTLS with service identities enforces that
+- **JWT hardening:** pin the allowed algorithms per issuer (never accept `alg: none` or let a token pick HMAC against a public key), check `aud` per route.
+- **Admin plane:** private network, SSO with MFA, RBAC so a team edits only its own routes, two-person review for global rules. Every change is audited with who, when, the diff and the resulting version.
+- **Abuse:** per-API-key and per-IP limits for anonymous routes, body and header size limits, header-read timeouts against slowloris, WAF rules for common injection patterns, and volumetric DDoS absorbed at the anycast/L4 layer before it reaches L7.
+- **PII in logs:** access logs contain IPs and user IDs. Redact `Authorization`, cookies and token-bearing query parameters before shipping, and apply a retention limit.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- **Availability:** 99.99% of requests not failed by the gateway itself (gateway errors, plus 503s from no healthy endpoint; backend 5xx count against the backend's SLO).
+- **Overhead:** 99% of requests add under 5 ms of gateway time, measured separately from backend time.
+- **Config propagation:** 99% of changes ACKed by all nodes within 10 s.
+
+**Dashboards:** per-route rate, errors and duration (the gateway is where every service's golden signals come from), Redis latency and fail-open count, ejected endpoints per cluster, config version skew across nodes, connections and TLS handshakes per node, certificate days-to-expiry. **Tracing:** the gateway starts the trace (`traceparent`) and makes the sampling decision, e.g. 1% of successes and all errors. **Paging:** burn-rate alerts on the gateway SLOs page the gateway team; a backend's error burn pages that backend's owners, not the gateway on-call. Certificate expiry under 7 days also pages.
+
+### Performance and cost
+
+**Bottleneck: TLS and connection handling.** TLS 1.3 with session resumption and ECDSA certificates cuts handshake CPU; HTTP/2 and keep-alive spread one handshake over many requests. Routing uses a prefix trie, not a list of regexes. For hot clients, batching rate-limit tokens cuts Redis calls ~100×.
+
+**Cost drivers:**
+- **Gateway compute:** ~60 nodes, of which roughly a third is zone-failure headroom. Cutting headroom saves nodes but turns a zone loss into overload.
+- **Access logs:** 1M req/s × ~500 bytes ≈ 500 MB/s, about 43 TB/day raw, often the largest gateway bill. Log all errors and a sample of successes, compress, and keep only days in the hot search index. Trade-off: less detail for forensic investigations of old incidents.
+- **Redis:** ~10 shards for 1M checks/s; token batching shrinks that, trading slight overshoot.
+- **Cross-zone traffic:** forwarding to backends in another zone is billed per GB. Zone-aware routing prefers local endpoints, at the risk of imbalance when one zone has fewer pods.
+
 ## Follow-up questions
 
 ### How do you avoid the gateway being a single point of failure?

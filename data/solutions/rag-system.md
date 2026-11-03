@@ -224,6 +224,67 @@ Every chunk carries `acl_principals` copied from its document (e.g. `["user:42",
 - **Freshness:** event-driven ingestion with per-document ordering, content-hash skipping and chunk-level diffing keeps the 5-minute target; deletes write a tombstone to both indexes immediately and purge later.
 - **Citations:** passages go into the prompt numbered `[1]..[8]` with titles, and the instructions require citing a number after each claim and replying "I couldn't find this in the documents" when nothing supports an answer. After generation, check that every cited number exists and map it back to `source_url` plus the character offsets, so the UI can highlight the exact passage.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres as the system of record** for documents, chunks and ACLs. It's the place that answers "what is indexed, at which version, visible to whom", needs transactional updates when a document version replaces the old one (new chunks in, stale ones out, in one step), and is small enough (~10M documents, ~100M chunk rows) for one sharded-by-tenant relational cluster. Both search indexes are **derived** from it and can be rebuilt from it plus stored embeddings.
+- **A dedicated vector DB** rather than a vector extension in Postgres. At 100M vectors (~102 GB int8 plus ~13 GB of graph) you want an engine that shards, filters during HNSW traversal and rebuilds segments in the background. A Postgres vector extension avoids a second system and is fine at a few million vectors; here scale and filtered search win over simplicity. BM25 lives in Elasticsearch/OpenSearch with the same ACL filter.
+- **ACID vs BASE:** ACID in Postgres for document state and ACLs. The two indexes are **BASE**: they converge within the 5-minute freshness target. The exception is **revocation**: a deleted document or a removed permission must stop appearing within ~1 minute, so tombstones and ACL updates take a fast path, and sensitive sources are re-checked against the source system at query time.
+- **CAP stance:** the query path is **AP** for content (a slightly stale passage is acceptable) but **fails closed on permissions**: if the principal cache and identity provider are both unreachable, refuse to answer rather than search with an unknown or empty principal set.
+
+### Service boundaries and communication
+
+- **Ingestion pipeline** (connectors, parser, chunker, embedding workers) and **query service**, plus GPU-backed **embedding**, **reranker** and **LLM** endpoints. Ingestion is split from querying because it's bursty batch work (a new tenant's backfill can be millions of documents) and must never steal capacity from interactive questions. Embedding and reranking run as separate model-serving services so their GPUs can be scaled and batched independently.
+- **Synchronous:** the whole `/ask` path (principals → embed → parallel search → rerank → LLM stream), because the user is waiting. Vector and BM25 run in parallel to keep within the latency budget.
+- **Asynchronous:** everything in ingestion via Kafka keyed by `doc_id`, which gives per-document ordering, buffering for backfills, and replay after a bug in the chunker.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| LLM provider slow or down | No answers; first token misses 1.5 s | **Timeout** on first token (~3 s), **circuit breaker** per provider, fail over to a second model, finally **degrade** to returning the reranked passages as search results |
+| Reranker GPU pool overloaded | Latency spike on every query | Timeout of ~200 ms on rerank; on timeout skip reranking and use the RRF order (**graceful degradation**, slightly worse relevance) |
+| One vector shard slow | Whole query waits on the slowest shard | Per-shard timeout, return partial results flagged as incomplete; replicas per shard and hedged requests for tail latency |
+| Parser crashes on a malformed PDF | Poison message blocks a partition | Retry with backoff, then **DLQ** and mark document `failed` in Postgres; other documents keep flowing |
+| New tenant backfill floods ingestion | Freshness for other tenants slips past 5 min | Per-tenant quotas and a separate low-priority backfill topic (**bulkhead**); embedding workers drain live changes first |
+| Source API rate-limits connectors | Changes and revocations delayed | **Exponential backoff with jitter** honoring `Retry-After`; prioritize permission and delete events over content changes |
+
+### High availability and disaster recovery
+
+- **SPOFs:** Postgres primary (synchronous standby, automatic failover), vector and BM25 shards (at least two replicas each across zones), principal cache (replicated; falls back to the identity provider), single LLM provider (a second provider or self-hosted model). Kafka across three zones.
+- **Zone vs region:** multi-zone per region is enough for availability. Enterprise tenants may require data to stay in a specific region, so deploy per-region stacks with tenants pinned to one, rather than replicating every tenant everywhere.
+- **Targets:** Postgres **RPO ≈ 0, RTO under 5 minutes**. The indexes need no strict RPO because they're rebuildable, but rebuild time is the real RTO: re-embedding 40B tokens takes far too long, so **store embeddings** (float32, ~410 GB, in object storage) and snapshot indexes daily. Restoring a snapshot and replaying a day of Kafka changes brings an index back in about an hour instead of days.
+
+### Security
+
+- **Authn/authz:** SSO via the tenant's identity provider; principals expanded server-side. ACL enforcement in the index (deep dive) plus source re-checks for sensitive content.
+- **Tenant isolation:** `tenant_id` filter on every query enforced in the query service, never from client input; large or regulated tenants get dedicated index shards. Caches are keyed by tenant and principal set.
+- **Encryption and secrets:** TLS everywhere; at-rest encryption on Postgres, indexes, embeddings and Kafka. Connector OAuth tokens are among the most powerful secrets here (they read a company's whole Drive), so store them in a secrets manager or encrypted with per-tenant keys, refresh them automatically, and let tenants revoke them.
+- **LLM provider:** prompts contain customer documents, so use a provider agreement with no training on inputs and limited retention, or self-host for tenants that require it.
+- **Audit:** log every question with the chunk IDs retrieved (the answer log), connector configuration changes, and admin access, so a tenant can ask "who saw this document through the assistant?".
+- **Abuse:** per-user and per-tenant rate limits on `/ask` (each costs LLM tokens), prompt-injection defenses from the follow-ups, size limits on uploads.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 95% of `/ask` requests stream a first token within 1.5 s; 99.9% succeed (including degraded search-only answers).
+- 99% of document changes searchable within 5 minutes; 99.9% of deletes and revocations effective within 1 minute.
+- **Zero** answers citing a chunk the user lacks access to (checked by sampled audits and canary documents with restricted ACLs).
+
+**Metrics:** latency per stage (embed, search, rerank, first token), recall@k on the evaluation set, "no relevant passages" rate, thumbs-down rate, ingestion lag per tenant, DLQ size, LLM tokens per query.
+
+**Tracing:** one trace per question with spans for each stage and shard, tagged with tenant and index version; ingestion traced per `doc_id` from webhook to index upsert.
+
+**Paging:** burn rate on first-token latency and success, freshness lag over target, and any ACL canary leak (immediate page). Quality drift is a daily review, not a page.
+
+### Performance and cost
+
+- **Main bottleneck:** LLM time to first token and generation. Levers: fewer, better passages (8 × 500 tokens is ~4k prompt tokens), provider-side prompt caching of the fixed instructions, streaming. Retrieval is light at ~50 queries/s peak.
+- **LLM tokens are the biggest cost:** 1M questions/day × ~4k input tokens ≈ 4B input tokens/day plus ~300M output tokens/day. Levers: cut passages from 8 to 5 (roughly a third fewer input tokens, small recall risk), route simple questions to a smaller model (cheaper, sometimes weaker answers), cache answers only for public stable content.
+- **Index memory:** ~115 GB per index copy, ~230 GB with one replica. int8 already cut 410 GB to 102 GB; product quantization would cut further at some recall cost.
+- **Embedding:** steady state is small (900k chunks × 500 tokens ≈ 450M tokens/day). The one-off cost is a model switch, re-embedding ~40B tokens, so change embedding models rarely and deliberately.
+
 ## Follow-up questions
 
 ### How do you evaluate retrieval and answer quality?

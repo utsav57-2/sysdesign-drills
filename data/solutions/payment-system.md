@@ -265,6 +265,72 @@ Most mismatches are timing (a payment captured at 23:59 settles the next day), s
 - Delivery is at-least-once: retry non-2xx responses with exponential backoff for days (Stripe retries for up to three days in live mode), then mark the endpoint failing. Merchants dedupe on `event.id`.
 - Events can arrive out of order, so payloads carry the current object state and merchants can always re-fetch via `GET`.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres, sharded by `merchant_id`, for intents, attempts, refunds, idempotency keys and outbox.** The core invariants are multi-row and transactional: the idempotency row, the intent's state change and the outbox event must commit together, and "refunds ≤ captured" must be checked and written atomically. At ~116 payments/s (1,200/s peak) a sharded relational DB has plenty of headroom. A NoSQL store was rejected because we'd rebuild transactions, constraints and the state-machine guards in application code, where bugs cost real money.
+- **A separate append-only ledger DB (also relational).** ~40M entries/day, ~14.6B rows/year, kept 7+ years. It needs the deferred "debits = credits" constraint and range queries by account and time, which relational partitioning handles well. It's split from the payments DB so heavy finance queries and long retention don't affect the confirm path.
+- **ACID vs BASE:** ACID for everything that moves or records money: intents, attempts, refunds, idempotency keys, ledger transactions. BASE is fine for webhooks (at-least-once, merchants dedupe), dashboards, search and analytics fed by CDC.
+- **CAP stance:** **CP, explicitly.** The requirement says "refuse or delay rather than guess". During a partition or failover, return 503 or `processing`, never accept a payment we can't durably record. The ledger is eventually consistent *with* the payments DB (it lags by the Kafka hop), but each ledger transaction is itself atomic and balanced; reconciliation proves the two converge.
+
+### Service boundaries and communication
+
+- **Card vault** is split out first, for PCI scope: only it and the detokenizing hop see card numbers, so every other service stays out of the most expensive audit scope.
+- **Payment service** (state machine, idempotency), **PSP router**, **ledger service**, **webhook dispatcher**, **reconciliation jobs**. The ledger is separate because it has a different owner (finance), retention, and correctness checks; the webhook dispatcher is separate because merchant endpoints are slow and unreliable and must not hold payment threads.
+- **Synchronous:** merchant → payment service → PSP, because the merchant needs an answer at checkout. Bounded by a timeout; past it we answer `processing`.
+- **Asynchronous:** ledger posting, webhooks, unknown-state resolution, reconciliation, all through outbox → Kafka. These must happen exactly once in effect, but not within the checkout latency budget.
+
+### Failure modes and reliability
+
+The deep dives cover PSP timeouts, backoff and circuit breakers; these are the rest.
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Payments DB shard primary fails | Confirms on that shard fail | Synchronous standby promoted; 503 during failover; merchants retry with the same idempotency key |
+| Ledger consumer bug or bad event | Postings stall; balances stale | Consumer stops on a balance-check failure rather than skipping; poison event goes to a **DLQ** and pages finance on-call; payments keep flowing since ledger is async |
+| One merchant's webhook endpoint hangs | Dispatcher threads tied up, all merchants' webhooks delayed | Short **timeouts** (~10 s), per-merchant concurrency caps as a **bulkhead**, backoff with jitter, mark endpoint failing after the retry window |
+| Peak sale traffic, 10× (1,200/s) | DB connections or PSP rate limits exhausted | Connection pooling per shard, per-merchant rate limits, **load shedding** of non-payment traffic (listing, reporting APIs) before confirms |
+| Recovery job crashes mid-resolution | Intents stuck in `unknown` | Job is idempotent and resumable; alert on count and age of `unknown` intents |
+| Card vault unavailable | No payments can be confirmed | Vault runs multi-zone with its own HSM-backed keys; no fallback that bypasses it, so this is a hard dependency with its own tighter SLO |
+
+### High availability and disaster recovery
+
+- **SPOFs:** each shard primary (synchronous standby in another zone), the vault, Kafka (three zones), the outbox relay (multiple instances with leader election), the PSP itself (several PSPs behind the router).
+- **Regions:** 99.99% allows ~52 minutes of downtime a year, so a region outage that takes hours to recover from would blow the budget. Run a warm standby region. Synchronous cross-region replication adds tens of ms per commit, which is affordable when PSP calls already take 300 ms–2 s; it buys RPO = 0 for region loss. The trade-off: if the link between regions fails, writes stall (CP again).
+- **Targets:** **RPO = 0** for committed payments, idempotency keys and ledger entries. **RTO under 1 minute** for zone failure, **under 15 minutes** for region failure. Backups: daily snapshots plus continuous WAL archiving, stored immutably in a separate account so a compromised operator can't delete them. Practice restores regularly; reconciliation against PSP reports is the final backstop for anything lost.
+
+### Security
+
+- **Authn/authz:** merchants use secret API keys (stored hashed, revocable, scoped per environment: test vs live) plus publishable keys for the browser SDK. Every query is scoped by the `merchant_id` from the key, enforced in the data access layer, so one merchant can never read another's payments.
+- **PCI scope:** card data only in the vault, encrypted with keys held in an HSM or KMS, rotated regularly with envelope encryption so rotation re-wraps data keys rather than re-encrypting every card.
+- **Encryption:** mutual TLS between internal services; TLS to PSPs; at-rest encryption on all databases and backups.
+- **Secrets:** PSP credentials and webhook signing secrets in a secrets manager; merchants can roll their webhook secret with an overlap window where both signatures are sent.
+- **Audit:** the ledger is the money audit trail; separately, log every admin action (refund overrides, manual ledger corrections, vault access) immutably with who, what and why.
+- **Abuse:** per-merchant rate limits, card-testing detection (many small declined auths from one merchant or IP), and velocity limits on refunds.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 99.99% of confirm requests return a valid response (not 5xx).
+- 99.9% of payments reach a final state (`captured`, `failed` or `canceled`) within 5 s; 99.99% within 1 hour.
+- 100% of ledger transactions balance; 99.9% of payments are posted to the ledger within 60 s.
+- 99% of webhooks delivered within 30 s to healthy endpoints.
+
+**Metrics:** authorization rate per PSP and card brand (a sudden drop is a PSP or routing problem), `unknown` intent count and age, outbox lag, ledger posting lag, reconciliation mismatch counts, webhook backlog per merchant.
+
+**Tracing:** each confirm across gateway → payment service → router → PSP, tagged with `intent_id` and `attempt_id`, linked to the ledger and webhook spans.
+
+**Paging:** burn rate on confirm availability; authorization rate dropping sharply; any unbalanced ledger transaction; `unknown` intents older than 15 minutes. A single PSP's circuit opening is a warning if the router fails over cleanly.
+
+### Performance and cost
+
+- **Main bottleneck:** PSP latency, not our system. Keep our overhead small: connection pooling to Postgres and PSPs, keep-alive connections, and route to the fastest healthy PSP. Ledger writes are batched per Kafka poll.
+- **PSP fees dwarf infrastructure cost.** Routing by cost per card type and region is the biggest lever; the trade-off is approval rate, which differs between PSPs, so route on expected revenue, not fee alone.
+- **Ledger storage:** 8 GB/day, 2.9 TB/year, ~20 TB over 7 years before replicas. Partition by month and move closed months to cheaper storage or a warehouse; the trade-off is slower audits of old periods.
+- **Replication:** synchronous standby plus cross-region copy roughly triples database spend. Worth it: RPO = 0 is a requirement, not a nice-to-have.
+- **Operational complexity:** each extra PSP adds integration, reconciliation and on-call work; two or three is typical.
+
 ## Follow-up questions
 
 ### Why not use a distributed transaction across the payment DB, ledger and PSP?

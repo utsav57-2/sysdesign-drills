@@ -160,6 +160,86 @@ WHERE ticket_id = 101 AND version = 7;          -- 7 = the version we read
 - Elasticsearch, kept in sync from Postgres via **change data capture** (Debezium → Kafka → indexer). This is more reliable than dual writes from application code.
 - Full text on names, geo-distance filters, date ranges, facets. Cache common queries at the CDN or in Redis for short periods.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres is the source of truth for tickets and bookings.** The data is small (~200M ticket rows), relational (event → tickets → booking → payment), and needs constraints, conditional updates and multi-row transactions for money. A NoSQL store would push the "never sold twice" invariant into application code. The deep dives cover the locking techniques. Add a **unique constraint on (`event_id`, `seat`)** as a safety net no code path can bypass.
+- **Redis seat holds are BASE on purpose.** They take hot contention off Postgres, but replication is asynchronous. A failover can lose recent holds, so two users may briefly "hold" one seat. That is safe because confirmation re-checks with a conditional update in Postgres. The worst case is one user getting an error after paying, followed by an automatic refund. That outcome is rare and recoverable, and it's the price of using a fast hold store.
+- **Waiting-room queue (Redis sorted set)**: losing it is a public fairness incident, so run it with replicas and append-only persistence.
+- **Elasticsearch and the CDN** serve views and search: eventually consistent, AP, fine to be seconds stale.
+- **CAP per path:** reserve and confirm are CP (better a 503 than a double sale); browse and search are AP; the waiting room leans CP (pause admissions rather than admit inconsistently).
+
+### Service boundaries and communication
+
+- **Waiting room / admission controller** runs at or near the edge because it alone faces millions of req/s. Its only output is a signed token, so the origin never sees the crowd.
+- **Booking service** is the CP core, kept small and separately scaled, with its own on-call.
+- **Event and search services** are read-heavy and cache-friendly.
+- **A payment webhook handler and reconciliation job** live with booking because they mutate the same rows.
+- **Synchronous:** reserve (Redis + Postgres), confirm, event page reads. The client calls the payment provider directly with a tokenized card.
+- **Asynchronous:**
+  - the provider's webhook back to us
+  - CDC → Kafka → Elasticsearch
+  - seat-availability pub/sub → SSE
+  - waitlist notifications
+  - the reconciliation sweep
+- Admissions are paced: 50k seats at ~2 tickets per order is ~25k orders. At the example 2,000 admissions/min, if most admitted users buy, the inventory clears in roughly 12–13 minutes. That is the knob to tune against booking-service and Postgres capacity.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Payment provider slow or down | Holds expire while users pay; seats churn | Extend the hold when payment starts; circuit breaker on provider calls; the controller **pauses admissions** so no new users take holds they can't complete |
+| Webhook lost or delivered twice | Paid booking stuck pending, or double-processed | Handler idempotent on `payment_intent_id`; reconciliation polls the provider before hold expiry (follow-up) |
+| Postgres primary fails over mid on-sale | ~30–60 s of failed reserves | Clients retry with idempotency key, exponential backoff and jitter; admission paused; access-token expiry extended by the outage length |
+| Redis hold node fails over and loses holds | Duplicate holds on a few seats | Postgres conditional update at confirm decides the winner; loser gets 409 and automatic refund |
+| Bot flood at queue entry | Edge and controller overloaded | Edge rate limits per IP/device, CAPTCHA at entry, load shedding of unauthenticated traffic |
+| SSE fan-out overloaded by seat churn | Seat maps lag or connections drop | Degrade to section counts or a polled availability bitmap (20k seats ≈ 2.5 KB) |
+
+### High availability and disaster recovery
+
+- **Postgres:**
+  - A synchronous standby in a second zone gives **RPO 0** for bookings. A confirmed booking whose payment was taken must never vanish.
+  - Automatic failover has **RTO under ~1 minute**.
+  - An asynchronous replica in another region has RTO ~30 minutes.
+  - Point-in-time recovery is kept for the financial-records retention period.
+- **Stateless services** run in three zones. Redis holds and the queue have replicas in other zones.
+- **Edge:** event pages are served with stale-if-error from the CDN, so browsing survives an origin outage. Optionally use two CDN providers for the waiting room on the biggest on-sales.
+- **On-sales are scheduled**, which gives a cheap DR lever: if a region or the payment provider is impaired at on-sale time, **postpone the on-sale**. That beats running a 10M-user event on degraded infrastructure.
+
+### Security
+
+- **Authn:** sessions/JWT for users. Booking requires the waiting-room token (signed, ~15 min, bound to user and event). Signing keys carry a key ID and are rotated with an overlap window.
+- **Authz:** promoter and venue staff roles can manage only their own events, inventory and holds-for-sale.
+- **Payments:** cards are tokenized client-side, which keeps us out of most PCI scope. Webhooks are verified with the provider's signature and a timestamp to block replays. Provider API keys live in a secrets manager and are rotated.
+- **PII:** names, emails, addresses and purchase history are encrypted at rest with KMS keys, and access to customer records is audit-logged.
+- **Audit:** an append-only log of booking state changes, refunds, price changes and manual inventory edits. Disputes and chargebacks need the full history.
+- **Abuse:**
+  - Enforce per-account and per-card purchase limits **inside the booking transaction** (count existing bookings for the user and event), not just at the edge.
+  - Rate-limit reserve calls per account and device.
+  - Defend login against credential stuffing, since accounts with presale access are valuable.
+
+### Observability
+
+- **SLIs and SLOs:**
+  - 99.9% of reserve requests from admitted users return success or a correct 409 within 500 ms, over each on-sale and over 30 days.
+  - 99.95% of successful payments become confirmed bookings within 30 s, with reconciliation catching the rest before hold expiry.
+  - 99.95% of event-page requests succeed (CDN-measured).
+  - **Zero double-sold seats** is an invariant, not an SLO. A continuous audit query plus the unique constraint; any violation pages.
+- **On-sale dashboard**, pre-staged per hot event: queue length and admission rate, reserve success and 409 rates, hold expiry rate (high means payment friction), Postgres lock waits and pool saturation, payment latency and errors.
+- **Tracing:** trace reserve → Redis → Postgres → payment → webhook → confirm with `booking_id` as the correlation key.
+- **Paging:** burn rates on reserve and confirm success, payment-confirmation lag, and invariant violations. High database CPU during an on-sale is expected and not paged.
+
+### Performance and cost
+
+**Bottleneck:** contended writes for one event on one Postgres primary. Redis holds and short conditional-update transactions keep each write to milliseconds. A connection pooler (e.g. PgBouncer) stops hundreds of booking pods from exhausting Postgres connections. The admission rate is the master throttle.
+
+**Cost drivers:**
+- **Spike capacity for minutes of millions of req/s.** On-sales are scheduled, so pre-scale for them instead of holding peak capacity all year. Serving the waiting room as a mostly static edge page with signed tokens costs far less than origin servers. The trade-off is logic split between edge and origin.
+- **Holding 10M SSE connections for queue position:** users at position 5M don't need second-by-second updates. Poll every 30–60 s with jitter, and switch to push only near the front. Updates for those far back become coarser.
+- **Search pipeline:** with only ~10k events on sale, Postgres full-text and PostGIS could serve search without Debezium, Kafka and Elasticsearch. Elasticsearch earns its operational cost through facets, typo tolerance and isolating search load from the booking database.
+- **Storage is negligible:** 200M ticket rows fit in one partitioned Postgres cluster.
+
 ## Follow-up questions
 
 ### How do you make the booking API idempotent?

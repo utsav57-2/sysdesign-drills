@@ -211,6 +211,72 @@ Each event is processed once; each window update is O(1) per item. Items with no
 - **Ingest side, viral items:** one item getting 100k views/s would overwhelm its partition. Pre-aggregate before the shuffle: each ingest node keeps a local count per item for 1–5 s and emits `(item, n)` instead of n separate events, which cuts traffic to the hot partition by orders of magnitude.
 - **Deduplication and abuse:** drop repeated views from the same user and item within a short period, and filter bots before counting, or trending becomes trivially gameable.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Kafka as the system of intake, not a database.** It absorbs 350k events/s and keeps them replayable for 7 days; a counter database was rejected in the deep dive.
+- **Flink keyed state** (on local disk, checkpointed to object storage) holds minute buckets. An external counter store would add a round trip per event and lose the atomic state-plus-offset checkpoint behind exactly-once counts.
+- **Redis for serving.** The whole serving dataset is at most 24,000 lists × ~30 KB ≈ 720 MB, and the API needs one key lookup.
+- **Cassandra for all-time totals:** 100M upserts a day, keyed lookups only. Have Spark compute `new_total = old_total + daily` and write the absolute value rather than using Cassandra counters, because counter increments aren't idempotent and a retried batch would double-count.
+- **Object storage + Parquet** for raw events: cheapest per TB, read natively by Spark.
+
+**Consistency stance.** Everything here is BASE and AP: a trending list two minutes stale, or off by a few thousand views, is invisible to users, while an error page is not. The one exception is anything with money attached. If creator payouts or ad billing use view counts, they must come from the exact batch path, never from the streaming numbers. Batch publishes write corrected lists under new keys and then flip a version pointer, so the API never serves a half-corrected mix.
+
+### Service boundaries and communication
+
+- **Ingest service** (validate, dedupe, bot filtering, 1–5 s pre-aggregation) is separate because it's the only internet-facing piece and scales with players.
+- **Flink jobs and the merger** do the counting. The merger can be a parallelism-1 Flink operator; it only merges 64 × 1,000 candidates every 30 s.
+- **Spark batch** and the **Top-K API** are separate because they scale on completely different axes (daily TB scans vs 10k req/s of key reads).
+- **Synchronous:** player → ingest (acknowledged once the event is in Kafka) and client → API → Redis. **Asynchronous:** everything between, through Kafka and scheduled batch. So a Flink outage shows up as a stale `asOf`, not failed video views.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Redis primary down | API can't read lists | Replica promotion; API keeps the last list per key in process memory and serves it with its old `asOf` (graceful degradation); CDN serves stale for 30 s |
+| Viral item floods one partition | That Flink task lags, freshness SLO slips for its partition | Ingest pre-aggregation (deep dive); Flink backpressure slows reading rather than dropping; alert on per-partition lag skew |
+| Malformed or wildly mis-timestamped event | Deserializer crash loop stalls the partition | Validate at ingest; anything unparseable in Flink goes to a side output / dead-letter topic with a counter, never a crash |
+| Player retries a view upload | Duplicate counts | Client-generated `event_id`; ingest dedupes over a short window; Flink exactly-once state and idempotent Redis overwrites cover the rest |
+| Kafka broker or AZ loss | Partitions move leaders | Replication factor 3 across AZs, `acks=all` with at least 2 in-sync replicas, producers retry with backoff and jitter |
+| Daily Spark job fails | Month/all-time lists don't update | Keep serving yesterday's lists (still correct within a day); retry the job idempotently since it overwrites by date partition |
+
+### High availability and disaster recovery
+
+- **Kafka** is the durability point: RF 3 across three AZs. Once acked, an event survives an AZ loss. RPO for raw events ≈ 0, apart from what's buffered in players.
+- **Flink** runs with a highly available job manager and checkpoints to object storage every ~30–60 s, so a crash costs at most that much reprocessing, which Kafka replay covers.
+- **Redis is a cache, not a source of truth.** The merger rewrites every list every 30 s, so even total Redis loss heals within a minute; a replica avoids even that gap.
+- **Region loss:** ingest runs in every region and mirrors to the processing region. If the processing region dies, the API (also multi-region, behind the CDN) serves the last lists with a stale `asOf` while a standby region replays mirrored Kafka. **RTO: 30 minutes for freshness**, since a frozen trending list is a mild degradation. **RPO: near zero for raw events**, which feed creator analytics and possibly payouts.
+- **Backups:** versioned raw Parquet is the real backup; every derived store can be recomputed from it.
+
+### Security
+
+- **Abuse is the main threat.** Trending is worth gaming. Require a signed playback session token on every view event, rate-limit per user, device and IP at ingest, count one view per user/item per window, and run bot scoring before counting.
+- **AuthN/AuthZ:** the Top-K API is public and read-only, rate-limited per client. Internally, mTLS between services and Kafka ACLs so only ingest can produce to the views topic and only the Flink job can consume it.
+- **PII:** `user_id` + `region` + timestamp is viewing history. Replace `user_id` with a keyed hash before archiving, drop IPs after dedupe, and set a retention limit on raw Parquet. The published lists contain no PII.
+- **Encryption:** TLS in transit; KMS-managed keys for object storage, Kafka disks and checkpoints, rotated on a schedule. Rotating the pseudonymization key breaks joins across the rotation, so rotate it at the retention boundary.
+- **Audit:** log warehouse queries on raw events and any editorial override that removes an item from trending.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- **Freshness:** in 99% of minutes, the global hour list's `asOf` is under 2 minutes old.
+- **Latency:** 99.9% of API requests under 50 ms.
+- **Availability:** 99.95% of API requests return 200.
+- **Accuracy:** at least 95% overlap between the streaming and batch top-100 for each day.
+
+**Metrics:** Kafka consumer lag per partition, checkpoint duration and failures, backpressure, late events dropped, dedupe and bot-filter rates, per-partition event-rate skew. **Tracing:** at 350k events/s, don't trace events; stamp ingest time on each event and measure ingest-to-publish delay at the merger. Trace API requests normally. **Page on:** freshness and API error-budget burn rates. A single task restart is not a page.
+
+### Performance and cost
+
+**Bottleneck: ingest and partition skew.** Producers batch (short linger, compression such as zstd or lz4), and pre-aggregation turns a viral item's 100k events/s into a few thousand `(item, n)` records. Incremental Flink checkpoints keep checkpoint cost proportional to changed state.
+
+**Cost drivers:**
+- **Raw storage:** 1 TB/day ≈ 365 TB/year before compression. Parquet's columnar encoding typically shrinks this several-fold; move partitions older than a month to a cold tier and delete after the retention limit. Trade-off: less history for backfills.
+- **Kafka disk:** 1 TB/day × RF 3 × 7 days = 21 TB. Cutting retention to 3 days gives 9 TB but shrinks the outage you can replay through.
+- **Cross-region egress:** shipping raw events to one processing region moves most of the 1 TB/day across regions. Pre-aggregating per region per minute before mirroring cuts that by orders of magnitude, at the cost of keeping raw archives regional.
+- **Operational complexity:** the lambda architecture means two pipelines that must agree. A kappa design (replay Kafka for corrections) removes Spark but needs longer, costlier Kafka retention.
+
 ## Follow-up questions
 
 ### Why not just use Redis sorted sets for everything (ZINCRBY on every view)?

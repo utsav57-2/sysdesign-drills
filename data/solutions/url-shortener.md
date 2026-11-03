@@ -156,6 +156,61 @@ The read service follows the **cache-aside** pattern: read Redis first; on a mis
 - At 500 GB a single Postgres primary with replicas is fine. If growth demands it, **shard by hash of `short_code`**: lookups always include the code, so each request hits exactly one shard and load spreads evenly.
 - DynamoDB or Cassandra are equally good fits for a pure key-value pattern if you'd rather not manage sharding yourself.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres for mappings.** 500 GB and ~100 writes/s at peak fit one primary with read replicas, and Postgres gives you the one guarantee that actually matters: a `PRIMARY KEY` on `short_code` that makes custom-alias conflicts a clean 409 instead of a race. DynamoDB or Cassandra would also work (see "Scaling storage"); the reason not to start there is that a single relational node is simpler to operate and you'd want conditional-put semantics for aliases anyway. Pick the KV store if the team doesn't want to run sharding later.
+- **ACID where it matters:** inserting a mapping (especially a custom alias) and editing a link's target must be atomic and unique. That's single-row, so you don't need multi-row transactions; a unique constraint is the ACID feature doing the work.
+- **BASE where it's fine:** Redis cache, CDN copies, cross-region replicas and click analytics are all eventually consistent. A new link 404ing for a second far away is acceptable per the requirements.
+- **CAP:** redirects are **AP**: during a partition, serve whatever the cache or replica has. Creation is **CP**: if the primary is unreachable, fail `POST /urls` rather than mint a code that might collide. The asymmetry matches the business: a failed click loses traffic for every customer whose links are in circulation; a failed create affects one user who can retry.
+- **The ID allocator is the one place eventual consistency is dangerous.** As the follow-up notes, an async Redis failover can reissue a block. Allocating blocks from a Postgres sequence removes that risk at negligible cost (one call per 1,000 IDs).
+
+### Service boundaries and communication
+
+- **Read service** and **write service**, split for the ~1000× load difference (already covered). Don't split further: an "alias service" or "expiry service" adds hops to a 100 ms budget for no scaling gain. Expiry cleanup is a batch job, not a service.
+- **Synchronous:** the redirect (cache → DB on miss) and the create (allocator → DB insert). Both are on the user's critical path and short.
+- **Asynchronous:** click events to Kafka (fire-and-forget with a bounded in-process buffer), malware rescans of existing links, cache/CDN purge fan-out on delete or edit (retried until acked), and the nightly expiry job.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Redis cache cluster down | All 12k–100k reads/s hit Postgres replicas | Replicas sized to survive a cold cache for a while; in-process LRU on read servers for top keys; shed load (503 with `Retry-After`) on cold misses rather than let replicas collapse |
+| Postgres primary fails | Creates fail; redirects unaffected | Automatic failover to a sync replica in another zone (~30 s); write service retries with backoff + jitter, idempotent on the allocated ID |
+| Slow DB on cache miss | Redirect p99 blows the 100 ms budget | Read timeout ~50 ms and a circuit breaker around the DB; serve stale cached entry if present |
+| Kafka unavailable | Click events can't be published | Bulkhead: the analytics producer has its own small buffer and drops events when full; redirects never block. Analytics loses data, users don't notice |
+| Delete/edit purge fails at CDN | Removed phishing link keeps redirecting | Purge jobs retry with backoff; failures go to a DLQ that pages trust & safety; short CDN TTLs bound the damage |
+| Viral link (1M req/s) | Hot Redis shard saturates | Edge cache with a few-seconds TTL plus in-process cache (see follow-up) |
+
+### High availability and disaster recovery
+
+- **SPOFs:** Postgres primary (sync replica + automatic failover), the ID allocator (block reservations ride out short outages; DB sequence is replicated with the DB), and the load balancer (managed, multi-zone).
+- **Deployment:** read path in multiple regions with local Redis and async DB replicas, because redirects are latency-sensitive and global. Writes in one primary region across 3 zones; a whole-region write outage only stops link creation, which is acceptable for minutes.
+- **Backups:** daily snapshots plus continuous WAL archiving, copied cross-region. 500 GB restores in well under an hour.
+- **RPO/RTO:** mappings RPO **0** within the primary region (sync replica), because a lost row means a printed short link that 404s forever, which is the worst failure this product has. Cross-region RPO of seconds is acceptable for regional disaster. Redirect RTO under 1 minute (traffic shifts to another region); create RTO under 15 minutes.
+
+### Security
+
+- **Authn/authz:** anonymous creation is allowed but heavily rate-limited; API keys or OAuth for higher limits, custom aliases, editing and deletion. Only a link's owner (`user_id`) can edit or delete it.
+- **Encryption:** TLS everywhere, including HSTS on the short domain so redirects can't be tampered with; encryption at rest for Postgres and backups. Long URLs can contain tokens in query strings (password-reset links, signed URLs), so treat `long_url` as sensitive and keep it out of application logs.
+- **Secrets:** the Feistel key used to scramble codes lives in a secrets manager. Be careful rotating it: a new permutation can map a new ID onto a code the old key already issued. If it must rotate (say it leaked), let the `short_code` primary key catch collisions and retry with the next ID, or move new links to 8-character codes.
+- **Audit:** log every edit and delete with actor and old target, since changing where a printed link points is a classic account-takeover payoff.
+- **Abuse:** the main risk is phishing and malware links on your trusted domain (see follow-up). Add per-IP and per-key creation limits, rescans, and a fast takedown path that purges cache and CDN. Rate-limit 404s per IP to slow enumeration.
+
+### Observability
+
+- **SLIs/SLOs:** 99.95% of redirects return a correct 302/404/410 (not 5xx) over 30 days; 99% of redirects served within 50 ms at the server (the 100 ms p99 budget includes the network). 99.9% of creates succeed within 200 ms. A new link resolvable globally within 5 s for 99% of creates.
+- **Dashboards:** redirect QPS, cache hit rate (target 90%+), DB replica load, 404 rate (spikes suggest enumeration or a replication lag bug), create rate per API key, Kafka producer drops.
+- **Tracing:** sample redirects end to end (edge → read service → Redis → DB), and trace every cache miss above the latency budget.
+- **Paging:** error-budget burn on redirect availability and latency. Cache hit rate dropping is a warning, not a page, unless the latency SLO burns.
+
+### Performance and cost
+
+- **Bottleneck:** redirect latency on cache misses. Keep a 90%+ hit rate with a few GB of LRU cache, pool DB connections from read servers (thousands of read-service instances opening raw connections would exhaust Postgres), and index only the primary key; `user_id` is a secondary index used only for the management UI.
+- **Storage** is cheap: 500 GB, growing ~1M rows/day × 500 B ≈ 0.5 GB/day (~180 GB/year). Expiring and archiving old rows keeps it on one node longer.
+- **Analytics is the real cost driver:** 1B clicks/day × ~200 B ≈ 200 GB/day of events, ~73 TB/year raw. Aggregate per code per minute in Flink and keep raw events only ~30 days; trade-off: you can't answer new per-click questions on old data.
+- **Edge vs. origin:** serving hot 302s from the CDN cuts origin compute and cross-region latency but makes takedowns and expirations lag by the TTL. Keep the edge TTL short (seconds to a minute).
 ## Follow-up questions
 
 ### What happens if two users shorten the same long URL?

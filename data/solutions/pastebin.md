@@ -159,6 +159,68 @@ Two separate concerns: **never serve an expired paste**, and **eventually reclai
 | B, never | 12:00 | null | served | served | never |
 | C, burn | 12:00 | null | served once, deleted | 404 | immediately |
 
+## Production readiness
+
+### Database choice and consistency
+
+- **DynamoDB for metadata.** Every access is by `paste_key` (plus an optional `owner_id` index), the table is small (~110 GB/year), and it gives three features this design leans on: conditional put for collision-free keys, built-in TTL for expiry, and a change stream for S3 cleanup. Postgres would work just as well at 12 writes/s, and is the better pick if the team wants ad hoc queries (abuse investigations, analytics); you'd then run your own expiry worker. The deciding factor is operational, not scale.
+- **S3 for content:** immutable blobs, 3.65 TB/year, highly durable. Rejected keeping content in the DB for the reasons in the deep dive.
+- **ACID vs BASE:** almost nothing here is multi-row. The two places needing atomicity are single-item operations: the "key must not exist" insert and the burn-after-read delete-and-return. Both are single-item conditional writes, which DynamoDB guarantees. Everything else (cache, CDN, owner index) is eventually consistent.
+- **Read consistency:** read metadata with **strongly consistent reads** right after creation (or route the creator's first view to the write path), since a just-created URL returning 404 looks broken. Everyone else can read eventually consistent replicas at half the cost.
+- **CAP stance:** reads are **AP**: serve from CDN and Redis even if the DB is unreachable. Burn-after-read is the exception and is **CP**: if we can't do the conditional delete, return 503 rather than risk showing it twice.
+
+### Service boundaries and communication
+
+- **One paste service** handles create, read and delete; the key generator is a library function (random + conditional insert), not a separate service. At 12 writes/s and ~1,200 reads/s, splitting reads and writes into separate services adds deploys and network hops without isolation benefit; scale the stateless service horizontally instead. The **cleanup worker** is separate because it's background, batch-shaped and triggered by the DynamoDB stream.
+- **Synchronous:** S3 put then metadata write on create; cache → DB → S3 on read miss.
+- **Asynchronous:** S3 cleanup from TTL deletes, malware and phishing scanning after creation, CDN purges on delete. Scanning synchronously would add seconds to creates for a rare case; the trade-off is that a malicious paste is live for the seconds until the scan finishes.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| S3 slow or erroring | Creates fail, cache-miss reads stall | **Timeouts** (~1 s on GET), **retries with exponential backoff and jitter**; **circuit breaker** returns 503 fast instead of piling up threads; hot pastes still served from CDN and Redis (**graceful degradation**) |
+| Crash between S3 put and metadata write | Orphaned S3 object | Harmless by design; S3 lifecycle rules and periodic reconciliation delete objects without a metadata row |
+| Cleanup worker fails on a TTL event | S3 object never removed | Stream retries; after N attempts the record goes to a **DLQ** for a reprocessing job. Correctness is unaffected because reads check `expires_at` |
+| Redis node down | Cache misses hit DynamoDB and S3 | Reads still work; DynamoDB on-demand absorbs a few thousand reads/s; request coalescing prevents a stampede on hot keys |
+| Viral paste or scraping burst | Origin overloaded | CDN serves `/raw`; per-IP rate limits and **load shedding** of anonymous creates before reads |
+| Client retries a create after timeout | Duplicate paste | `Idempotency-Key` maps a retry to the original key |
+
+### High availability and disaster recovery
+
+- **SPOFs:** none in the core path if the paste service runs in several zones; DynamoDB and S3 are regional, multi-zone services. Redis gets a replica, but losing it only costs latency.
+- **Regions:** single region with cross-region replication is enough. Pastebin is not critical infrastructure; an hour of read-only or degraded service during a region loss is acceptable. Replicate S3 objects and use a cross-region copy of the table (DynamoDB global tables, or backups) for DR.
+- **Targets:** **RPO of minutes** (async S3 replication may lag; a paste created seconds before a region dies could be lost, conflicting with "never lost" only in that rare disaster), **RTO of about an hour** with manual DNS failover. Within a region, RPO is effectively zero since writes are acknowledged only after durable storage. Enable point-in-time recovery on the table to undo a bad deploy that corrupts metadata.
+
+### Security
+
+- **Authn/authz:** optional login. Deletes need either ownership or the delete token; store the token **hashed**, never in plaintext, so a metadata leak doesn't let anyone delete pastes.
+- **Unguessable keys:** 8 random CSPRNG characters, plus read rate limits per IP to slow enumeration (see the collision maths above).
+- **Encryption:** TLS everywhere; S3 and DynamoDB encryption at rest with managed keys rotated on a schedule. Users pasting secrets is common, so offer client-side encryption with the key in the URL fragment for sensitive pastes.
+- **Secrets accidentally pasted:** detect API keys and tokens in public pastes asynchronously and warn or notify the issuer; secret-scanning partners exist for some providers.
+- **Audit:** log takedowns and admin reads of private pastes.
+- **Abuse:** creation rate limits per IP and account, 10 MB size cap, malware and phishing scanning, `noindex` on unlisted pastes, a report button feeding takedowns that also purge the CDN.
+
+### Observability
+
+**SLIs and SLOs (30-day window):**
+- 99.9% of paste reads return within 100 ms (measured at the origin and at the CDN edge).
+- 99.95% of creates succeed.
+- 0 expired pastes served (checked by synthetic pastes with a 10-minute expiry, read every minute after).
+
+**Metrics:** CDN and Redis hit ratios, S3 latency and error rate, DynamoDB throttles, key-collision retries (should be ~0), 404 rate (a spike suggests enumeration), orphaned-object count.
+
+**Tracing:** create (S3 put → conditional write) and cache-miss reads, to see whether latency is S3 or the DB.
+
+**Paging:** burn rate on read latency and create errors, and any expired paste served. A dropping CDN hit ratio is a ticket, not a page.
+
+### Performance and cost
+
+- **Main bottleneck:** cache-miss reads of large pastes, which pay an S3 round trip. Levers: inline pastes under 4 KB, redirect large ones to presigned URLs, CDN in front of `/raw`.
+- **Egress is the biggest cost, not storage.** 1,200 reads/s × 10 KB ≈ 12 MB/s ≈ 1 TB/day served. The CDN cuts origin egress and is usually cheaper per GB; trade-off is caching expiry correctly with capped `max-age`.
+- **Storage:** 10 GB/day, 3.65 TB/year, and "never" pastes accumulate forever. Levers: move pastes not read for 90 days to an infrequent-access storage class (cheaper storage, per-retrieval fees); default the expiry to 1 month instead of never. Cross-region replication doubles storage and adds transfer of ~10 GB/day.
+- **Request charges:** ~1M S3 PUTs/day; inlining small pastes removes most of them and their GETs.
+
 ## Follow-up questions
 
 ### How do you support custom aliases like /my-config?

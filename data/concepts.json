@@ -7,7 +7,8 @@
     { "id": "communication", "name": "Communication & Real-time" },
     { "id": "async", "name": "Async Processing" },
     { "id": "algorithms", "name": "Data Structures & Algorithms" },
-    { "id": "technologies", "name": "Key Technologies" }
+    { "id": "technologies", "name": "Key Technologies" },
+    { "id": "production", "name": "Production Readiness" }
   ],
   "concepts": [
     { "id": "caching", "group": "fundamentals", "name": "Caching", "summary": "Cache-aside, write-through, write-back; eviction; invalidation; hot keys." },
@@ -22,7 +23,6 @@
     { "id": "microservices", "group": "fundamentals", "name": "Microservices", "summary": "Splitting a system into independently deployable services." },
     { "id": "service-discovery", "group": "fundamentals", "name": "Service Discovery", "summary": "How services find each other (registry, DNS, sidecars)." },
     { "id": "autoscaling", "group": "fundamentals", "name": "Autoscaling", "summary": "Adding/removing capacity automatically based on load." },
-
     { "id": "data-modeling", "group": "data", "name": "Data Modeling", "summary": "Choosing entities, keys, and access patterns; SQL vs NoSQL." },
     { "id": "denormalization", "group": "data", "name": "Denormalization", "summary": "Duplicating data to speed reads at the cost of write complexity." },
     { "id": "blob-storage", "group": "data", "name": "Blob Storage", "summary": "Object storage (S3) for large files; metadata kept in a DB." },
@@ -35,7 +35,6 @@
     { "id": "ledger", "group": "data", "name": "Double-entry Ledger", "summary": "Immutable debit/credit records that always balance." },
     { "id": "feature-store", "group": "data", "name": "Feature Store", "summary": "Shared storage of ML features for training and online serving." },
     { "id": "offline-sync", "group": "data", "name": "Offline Sync", "summary": "Buffer data on device and reconcile when connectivity returns." },
-
     { "id": "sharding", "group": "scaling", "name": "Sharding / Partitioning", "summary": "Split data across nodes by key; choosing a shard key; hot partitions." },
     { "id": "partitioning", "group": "scaling", "name": "Partitioning (Logs/Topics)", "summary": "Split a stream into partitions for parallelism with per-partition order." },
     { "id": "consistent-hashing", "group": "scaling", "name": "Consistent Hashing", "summary": "Distribute keys so adding/removing nodes moves minimal data." },
@@ -43,7 +42,6 @@
     { "id": "fan-out", "group": "scaling", "name": "Fan-out (Write vs Read)", "summary": "Precompute per-user feeds on write, or assemble on read." },
     { "id": "gossip", "group": "scaling", "name": "Gossip Protocol", "summary": "Peer-to-peer membership and failure detection." },
     { "id": "leader-election", "group": "scaling", "name": "Leader Election", "summary": "Pick one coordinator (Raft, ZooKeeper, etcd)." },
-
     { "id": "cap-theorem", "group": "consistency", "name": "CAP / PACELC", "summary": "Trade-off between consistency and availability under partitions." },
     { "id": "consistency", "group": "consistency", "name": "Consistency Models", "summary": "Strong, eventual, read-your-writes, causal." },
     { "id": "quorum", "group": "consistency", "name": "Quorum (N/R/W)", "summary": "R + W > N gives overlap between reads and writes." },
@@ -59,12 +57,10 @@
     { "id": "operational-transform", "group": "consistency", "name": "Operational Transform", "summary": "Transform concurrent edit operations through a central server." },
     { "id": "clock-sync", "group": "consistency", "name": "Clocks & Time", "summary": "Clock skew, NTP, logical/vector clocks." },
     { "id": "state-machine", "group": "consistency", "name": "State Machines", "summary": "Model entity lifecycles (orders, rides) with explicit transitions." },
-
     { "id": "websockets", "group": "communication", "name": "WebSockets", "summary": "Bidirectional persistent connections for real-time apps." },
     { "id": "sse", "group": "communication", "name": "Server-Sent Events", "summary": "One-way server push over HTTP." },
     { "id": "pub-sub", "group": "communication", "name": "Pub/Sub", "summary": "Decouple publishers and subscribers (Redis pub/sub, Kafka, SNS)." },
     { "id": "webhooks", "group": "communication", "name": "Webhooks", "summary": "Callbacks to external systems on events, with retries and signing." },
-
     { "id": "message-queue", "group": "async", "name": "Message Queues", "summary": "Buffer work for async processing (SQS, RabbitMQ, Kafka)." },
     { "id": "retries", "group": "async", "name": "Retries & DLQ", "summary": "Exponential backoff with jitter; dead-letter queues." },
     { "id": "stream-processing", "group": "async", "name": "Stream Processing", "summary": "Windowed real-time aggregation (Flink, Kafka Streams)." },
@@ -74,7 +70,6 @@
     { "id": "media-processing", "group": "async", "name": "Media Processing", "summary": "Transcoding/resizing pipelines run as async jobs." },
     { "id": "virtual-queue", "group": "async", "name": "Virtual Waiting Queue", "summary": "Admit users gradually during extreme traffic spikes." },
     { "id": "sandboxing", "group": "async", "name": "Sandboxing", "summary": "Isolate untrusted code (containers, gVisor, Firecracker)." },
-
     { "id": "hashing", "group": "algorithms", "name": "Hashing", "summary": "Hash functions for keys, dedup, and partitioning." },
     { "id": "base62", "group": "algorithms", "name": "Base62 Encoding", "summary": "Compact alphanumeric encoding of numeric IDs." },
     { "id": "key-generation", "group": "algorithms", "name": "Key Generation", "summary": "Counters, hashing, or pre-generated key pools for unique IDs." },
@@ -92,10 +87,19 @@
     { "id": "graph-algorithms", "group": "algorithms", "name": "Graph Routing", "summary": "Dijkstra, A*, contraction hierarchies for shortest paths." },
     { "id": "adaptive-bitrate", "group": "algorithms", "name": "Adaptive Bitrate Streaming", "summary": "HLS/DASH segments at multiple qualities chosen by bandwidth." },
     { "id": "order-book", "group": "algorithms", "name": "Order Book", "summary": "Price-time priority matching of buy and sell orders." },
-
     { "id": "redis", "group": "technologies", "name": "Redis", "summary": "In-memory store: cache, sorted sets, geo, locks, pub/sub." },
     { "id": "kafka", "group": "technologies", "name": "Kafka", "summary": "Durable partitioned log for streaming and event-driven systems." },
     { "id": "cassandra", "group": "technologies", "name": "Cassandra", "summary": "Wide-column, write-optimized, leaderless NoSQL DB." },
-    { "id": "elasticsearch", "group": "technologies", "name": "Elasticsearch", "summary": "Full-text and geo search engine built on inverted indexes." }
+    { "id": "elasticsearch", "group": "technologies", "name": "Elasticsearch", "summary": "Full-text and geo search engine built on inverted indexes." },
+    { "id": "database-selection", "group": "data", "name": "Choosing a Database", "summary": "Relational vs key-value, wide-column, document, search and time-series stores, and how to justify the pick." },
+    { "id": "acid-vs-base", "group": "consistency", "name": "ACID vs BASE", "summary": "Transactional guarantees versus basically-available, eventually consistent systems, and when each fits." },
+    { "id": "sync-vs-async", "group": "communication", "name": "Sync vs Async Communication", "summary": "Request-response versus events and queues: coupling, latency, failure handling and consistency." },
+    { "id": "schema-registry", "group": "technologies", "name": "Schema Registry & Evolution", "summary": "Avro/Protobuf schemas for event streams, compatibility modes, and evolving data contracts safely." },
+    { "id": "reliability-patterns", "group": "production", "name": "Reliability Patterns", "summary": "Timeouts, retries with backoff, circuit breakers, bulkheads, load shedding and graceful degradation." },
+    { "id": "high-availability", "group": "production", "name": "High Availability & DR", "summary": "Removing single points of failure, failover, multi-zone and multi-region, backups, RPO and RTO." },
+    { "id": "security", "group": "production", "name": "Security by Design", "summary": "Authentication, authorization, encryption, secrets and key rotation, audit logs, and abuse protection." },
+    { "id": "observability", "group": "production", "name": "Observability", "summary": "Metrics, logs and traces; SLIs, SLOs and error budgets; alerting that pages on symptoms." },
+    { "id": "performance", "group": "production", "name": "Performance Optimization", "summary": "Finding the bottleneck, then indexing, batching, pooling, compression and async work." },
+    { "id": "cost-optimization", "group": "production", "name": "Cost Optimization", "summary": "What drives the bill (compute, storage, replication, egress) and how architecture choices change it." }
   ]
 }

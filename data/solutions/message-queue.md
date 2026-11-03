@@ -240,6 +240,72 @@ Side effects outside Kafka (sending an email, calling an API) cannot join the tr
 - **Better:** an external ZooKeeper ensemble stores metadata and elects a controller (classic Kafka). Works, but it's a second system to run and metadata changes for many partitions are slow.
 - **Best:** **KRaft**, a Raft quorum of 3 or 5 controller nodes that stores metadata as its own replicated log. Brokers tail that log. Failover of a controller takes seconds and the cluster scales to far more partitions. ZooKeeper support was removed in Kafka 4.0.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **The log is the database.** Message data lives in partition segment files on broker disks, not in a general-purpose store. A relational DB would add per-row index and transaction work you never use, and a KV/LSM store adds compaction you don't need (the "Better" option in the deep dive). Nothing here needs multi-row ACID except the narrow Kafka transactions used for exactly-once pipelines.
+- **Cluster metadata** (topics, leaders, ISR, epochs) sits in the KRaft quorum. This is the one place that must be strongly consistent: two brokers both believing they lead p0 would fork the log. It is **CP**: without a Raft majority, no leadership changes happen, but existing leaders keep serving.
+- **Message data is tunable per topic.** `acks=all` + `min.insync.replicas=2` + unclean election off is CP: a partition that can't reach 2 in-sync replicas rejects writes rather than accept ones it might lose. Payments or order events take this. Clickstream or metrics topics can use `acks=1` or allow unclean election, choosing availability and accepting a small loss window. That is a business call made per topic, not cluster-wide.
+- **Committed offsets** live in the compacted `__consumer_offsets` topic: same replication, no extra database.
+
+### Service boundaries and communication
+
+- **Brokers** (data) and **controllers** (metadata) are split so elections never queue behind 1 GB/s of data traffic, and the 3–5 controllers are placed independently of the ~45 brokers.
+- **No proxy tier** for native clients: the fat client talks straight to partition leaders, which avoids an extra hop and an extra fleet.
+- **Schema registry** is a separate service: producers look a schema up synchronously once, then cache it by ID, so the registry is off the hot path and a registry outage only blocks *new* schemas.
+- **Sync vs async:** `Produce` is async to the application (callback/future) but the ack is synchronous to replication when `acks=all`. Follower replication is pull-based, and cross-region mirroring is fully async, because a WAN round trip per batch would blow the 100 ms p99.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Broker crash | Its ~67 partition leaders (3,000 ÷ 45) are briefly unavailable | Controller elects ISR leaders in seconds; clients refresh metadata and retry with backoff; idempotent producer drops duplicate retries |
+| Slow follower (disk or GC) | `acks=all` latency rises until it leaves the ISR | `replica.lag.time.max.ms` drops it; alert on ISR shrink; replace bad disks rather than lower acks |
+| Hot partition from a skewed key | One leader saturates, consumer lag on that partition only | Better key choice or a salted key where per-key order isn't needed; per-client produce quotas; spread leaders across brokers |
+| Poison message in a consumer | Consumer crash-loops, partition stalls | Bounded retries with backoff, then the retry/DLQ topics from the follow-ups; never block a partition forever |
+| Rebalance storm (slow consumer misses `max.poll.interval.ms`) | Group stops repeatedly, lag climbs | Cooperative sticky assignor, static membership, smaller poll batches, processing time budgets |
+| Whole-zone outage | One replica of every partition gone | Rack-aware placement across 3 zones keeps 2 replicas, so `min.insync.replicas=2` still accepts writes |
+
+### High availability and disaster recovery
+
+- **SPOFs removed:** every partition has 3 replicas on different brokers in different zones; controllers are a 3- or 5-node quorum spread across zones; clients bootstrap from several brokers.
+- **Zone vs region:** one cluster stretched across 3 zones in a region, because synchronous replication across zones costs a millisecond or two, while across regions it would cost tens. A second region gets an async mirror.
+- **Targets:** within a region, **RPO 0** for acked `acks=all` writes and **RTO of seconds** per partition. For region loss, **RPO = mirror lag (target under 30 s)** and **RTO about 15 minutes**, mostly spent repointing clients and translating consumer offsets.
+- **Backups:** replication isn't a backup. A bad producer or a mistaken topic deletion replicates instantly. Keep tiered-storage segments in a versioned bucket with deletion protection, and restrict topic deletion via ACLs.
+
+### Security
+
+- **AuthN:** mTLS or SASL for clients and inter-broker traffic. **AuthZ:** per-principal ACLs on topic, consumer group and cluster operations (e.g. the payments service can write `payments`, and only its consumers can read it).
+- **In transit:** TLS everywhere. Note that TLS disables the zero-copy `sendfile` path, so expect more broker CPU and size for it.
+- **At rest:** encrypted volumes and bucket encryption with KMS keys rotated on a schedule. For PII, encrypt fields client-side so brokers and operators never see plaintext; a per-tenant key also allows crypto-shredding before the 7-day retention expires.
+- **Secrets:** client credentials come from a secrets manager and rotate without restarts by overlapping old and new credentials.
+- **Audit:** log every ACL change, topic create/delete and authorization failure.
+- **Abuse:** per-client produce/fetch byte-rate and request-rate quotas, so one runaway producer can't consume the 1 GB/s budget for everyone.
+
+### Observability
+
+**SLIs and SLOs (30-day windows):**
+- 99.9% of `acks=all` produce requests succeed, with p99 latency under 50 ms.
+- 99.9% of messages are consumable within 100 ms of ack (end-to-end probe topic).
+- 99.99% of partitions online (have a leader) per minute.
+
+**Dashboards:** bytes in/out per broker, under-replicated and under-min-ISR partitions, request queue time, disk usage against the 40 TB per broker, consumer lag in both offsets and seconds per group.
+
+**Tracing:** propagate a trace context in record headers so a span covers producer → broker → consumer → downstream write.
+
+**Paging:** fast burn on the produce-error SLO, any offline partition, and consumer lag in seconds approaching retention. Under-replicated partitions alone open a ticket, since they're a cause that usually self-heals.
+
+### Performance and cost
+
+**Bottleneck:** disk and network per broker, not CPU. Tune with larger producer batches (`linger.ms` 5–20 ms) and zstd compression. Batching trades a few ms of latency for far fewer requests; compression trades producer CPU for halving both the 3 GB/s of replicated writes and the 3 GB/s of egress if it halves payloads.
+
+**Cost drivers:**
+- **Storage, 1.8 PB replicated.** Tiered storage keeping 1 day local cuts broker disk to 1 GB/s × 86,400 s × 3 ≈ 259 TB, with the 605 TB of history in object storage (which handles its own durability). The trade-off is that old-offset replays are slower and depend on object-store availability.
+- **Cross-zone traffic.** The 2 GB/s of follower replication is about 173 TB/day crossing zones, plus consumer fetches. Rack-aware consumers can fetch from a same-zone follower, at the cost of slightly higher end-to-end latency. Replication traffic itself is the price of zone-level durability.
+- **Cross-region mirroring.** At 1 GB/s this is about 86 TB/day of egress. Mirror only the topics that need DR rather than all 100.
+- **Operational complexity.** 45 brokers and 3,000 partitions need rolling upgrades and partition rebalancing tooling. A managed service trades unit price for on-call load.
+
 ## Follow-up questions
 
 ### How do you guarantee ordering for all events of one user?

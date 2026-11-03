@@ -154,6 +154,62 @@ Video codecs don't store every frame in full. A **keyframe (I-frame)** is a comp
 - **View counts:** player heartbeats → Kafka → stream aggregation → periodic batched updates. Never increment a DB row per view; dedupe and filter bots in the stream.
 - **Search:** index title, description, tags and captions in Elasticsearch, kept in sync with metadata via change data capture.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Object storage for originals and segments.** Petabytes of immutable blobs, written once and read through the CDN. Nothing else is cost-effective at this size.
+- **Metadata DB: sharded MySQL (or Vitess-style) by `video_id`, or Cassandra.** Video rows have a real state machine (`uploading → processing → ready`) and ownership checks, and the creator's dashboard needs "my videos" queries. Relational is the simpler choice for correctness on the creator side; the row count (hundreds of thousands of new videos per day) is high but partitions cleanly by `video_id`. Cassandra is a fine alternative if you accept doing the status transitions with lightweight transactions and maintaining a separate `uploader_id → videos` table.
+- **Upload state** (part ETags, progress) lives with the object store's multipart session plus a small row per upload; it's short-lived.
+- **View counts and watch history:** Kafka → stream aggregation → batched counters, explicitly BASE (deep dive).
+- **ACID where it matters:** status transitions (a video must not show as `ready` before its manifest exists), takedowns and privacy changes (a video switched to private must stop being listed), and monetization-relevant data. **BASE:** view counts, search index, recommendations, CDN copies.
+- **CAP:** playback is **AP**: if metadata is unreachable, serve the cached manifest URL; a slightly stale title is fine. Privacy and takedown changes lean **CP**: they must win over cached copies quickly, which is why manifests get short TTLs and are signed while segments are long-lived.
+
+### Service boundaries and communication
+
+- **Video service** (metadata, upload initiation), **pipeline orchestrator** + **transcode workers**, **playback/manifest service**, **search**, **view counting**. Transcoding is split out because it's 99% of compute, bursty, and runs on cheap preemptible capacity; it must never share resources with the metadata API.
+- **Synchronous:** `POST /videos` (issue presigned URLs), `GET /videos/{id}`, segment fetches from the CDN. **Asynchronous:** everything after upload. `complete` returns `202`, the object-store event starts the DAG, tasks flow through a queue, and the creator is notified when the video is ready. Making a user wait on a multi-minute transcode would be wrong. View events, search indexing (CDC) and thumbnails are async too.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Spot/preemptible transcode workers reclaimed | Tasks die mid-chunk | Short per-chunk tasks, lease expiry, idempotent outputs under deterministic keys; retry with backoff; DLQ after N failures (see follow-up) |
+| Corrupt or malicious upload | Workers crash repeatedly | Validate + probe first; run decoders in sandboxes with CPU/memory caps; failing videos go to a DLQ and the creator gets an error |
+| Upload surge (major event) | Transcode backlog, slow time-to-watchable | Priority queues: low/mid renditions first; defer 4K and AV1 encodes; autoscale on queue age |
+| CDN edge or provider outage | Rebuffering in a region | Multi-CDN or multiple edge tiers; client retries the next segment against an alternate host; ABR drops bitrate (graceful degradation is built into the player) |
+| Long-tail misses flood origin | Origin storage throttled | Origin shield collapses concurrent misses for the same segment into one fetch; rate-limit per edge |
+| Metadata DB shard down | Video pages fail for that shard | Read replicas plus Redis cache serve `GET /videos/{id}`; upload initiation for those IDs retries with backoff |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the orchestrator (run it on a replicated workflow engine so state survives node loss), metadata primaries (per-shard standby across zones), and the upload endpoint (stateless, multi-region).
+- **Regions:** playback is inherently multi-region via the CDN. Metadata is replicated to several regions for reads; writes go to the home region per shard. Transcoding can run in any region with capacity, so a regional loss only slows processing.
+- **Originals are the irreplaceable asset**: renditions can be regenerated, but originals can't. Store originals with cross-region replication (or erasure coding across regions), and keep renditions single-region-redundant for long-tail videos.
+- **RPO/RTO:** originals RPO 0 once `complete` has returned (the upload isn't acknowledged until durably stored). Metadata RPO under a minute. Playback RTO under 1 minute for a region (CDN rerouting); uploads and processing RTO under an hour, since creators tolerate delay far better than viewers do.
+
+### Security
+
+- **Authn/authz:** OAuth for creators; only the owner (or delegated channel managers) can edit, delete or change privacy. Presigned upload URLs are scoped to one `upload_id` and expire in hours.
+- **Private and unlisted videos:** unguessable IDs aren't enough; use signed, expiring manifest URLs (and signed segment URLs or cookies for private and premium content), checked at the CDN edge.
+- **Encryption:** TLS for all delivery and APIs; at-rest encryption for originals. DRM for premium content (follow-up). Signing keys for CDN URLs live in a secrets manager and are rotated with overlap, accepting both old and new keys for one TTL window so existing playback sessions don't break.
+- **Audit:** log takedowns, privacy changes, and admin access to private videos.
+- **Abuse:** per-account upload quotas and rate limits, content scanning (copyright fingerprinting, policy classifiers) as a pipeline stage before `ready`, and bot filtering for view counts so they can't be inflated.
+
+### Observability
+
+- **SLIs/SLOs:** video start time under 2 s for 95% of plays; rebuffering ratio (stall time / watch time) under 0.5%; 99.9% of segment requests succeed; 95% of uploads watchable at a low rendition within 10 minutes of `complete`.
+- **Dashboards:** client-side QoE (startup time, rebuffers, average bitrate, errors) by region, ISP and device; CDN hit rate and origin egress; transcode queue age by priority; failure rate per pipeline stage; DLQ size.
+- **Tracing:** one trace per upload through the DAG, so a slow video points at the stage; client beacons per playback session for QoE.
+- **Paging:** burn rate on start time and rebuffering per region (symptoms viewers feel), segment error rate, and time-to-watchable. One worker pool losing spot capacity is not a page unless queue age breaches the SLO.
+
+### Performance and cost
+
+- **Bottleneck:** delivery. 1B DAU × 1 hour × 2 Mbps ≈ 900 PB/day, ~80 Tbps averaged and well past that at peak. CDN hit rate is the lever: every point of hit rate saves a large slice of origin egress. Push popular content to ISP-embedded caches; use origin shields for the long tail.
+- **Storage:** 720k hours/day × (~6–13 GB) ≈ 4–9 PB/day, so on the order of 1.5–3.5 EB per year. Levers: cold-tier originals after processing; delete renditions of videos with no views for months and regenerate on demand (trade-off: a slow first play); skip 4K renditions for low-view videos.
+- **Encoding:** better codecs (AV1/VP9) cut egress bitrate noticeably for the same quality but cost several times more compute to encode. Spend it only on videos popular enough that the egress savings repay it.
+- **Compute:** spot capacity for transcoding saves a lot, at the cost of retries and longer tails for some jobs.
+
 ## Follow-up questions
 
 ### How do you make a video watchable as fast as possible after upload?

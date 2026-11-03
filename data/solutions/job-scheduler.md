@@ -247,6 +247,71 @@ Classic cron quirk: if both day-of-month and day-of-week are restricted, a day m
 - Dispatch is idempotent (conditional `scheduled → queued` and stable execution IDs), so a brief double-ownership during handover only risks a duplicate enqueue, which workers already tolerate.
 - The queue (SQS, Kafka with a delay layer, or a Redis-backed queue) is replicated; pollers are stateless and the executions table is the source of truth, so recovery means re-scanning recent buckets.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Job definitions in Postgres** (sharded by `job_id`). 100 GB of human-edited rows with ownership, status and idempotency keys benefit from constraints and transactions: "create job unless this idempotency key exists" is one transaction.
+- **Executions in a wide-column store** (DynamoDB/Cassandra). 864M rows/day, 13 TB of history and a `(time_bucket, shard)` access pattern suit them; Postgres would need heavy partitioning and vacuuming at ~10k inserts/s plus updates.
+- **Cross-store atomicity:** creating a job writes Postgres, then the first execution row in the other store. Rather than a distributed transaction, a **reconciler** periodically finds active jobs with no future execution row and creates one. Losing a write only delays a job briefly.
+- **Consistency per path:** state transitions (`scheduled → queued`, lease, `complete`) need **per-row compare-and-set**, done with conditional writes. In Cassandra that means lightweight transactions, which run Paxos and are expensive at this rate, so a store with cheap conditional writes is preferable. History views can be **eventually consistent** (a secondary index lagging by a second is fine). Shard ownership in ZooKeeper/etcd is **CP**: during a partition, pollers stop dispatching rather than risk two owners. That trades a few seconds of lag for fewer duplicates.
+
+### Service boundaries and communication
+
+- **Job API** (CRUD, validation, cron parsing), **pollers** (dispatch), the **queue**, and the **coordination service** are platform components. **Workers** belong to the teams that own each task type. That ownership line is the most important boundary: task code crashes, hangs and deploys on its own schedule, and must not be able to stall dispatch.
+- **Sync vs async:** client → API is synchronous (the client needs `jobId` and `nextRunAt`). Dispatch is async through the queue, which provides delay, leasing and redelivery for free. The worker protocol (`lease`, `heartbeat`, `complete`) is synchronous and small.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Hot buckets at `:00` (1.8M rows) | DB throttling, schedule lag beyond 2 s | Pre-dispatch a minute early with delays, more shards for hot minutes, encourage jittered crons (follow-up) |
+| Queue unavailable | Pollers can't enqueue; rows stay `scheduled` | Pollers retry with backoff and a circuit breaker; the catch-up scan of earlier buckets dispatches them later, rate-limited so recovery isn't a thundering herd |
+| Downstream of one task type slow (e.g. email API) | Workers hang, leases pile up | Per-task-type queues and pools (bulkhead); per-job execution timeout; retries with backoff and jitter |
+| Poison job crashes its worker | Crash loop, repeated redelivery | `maxAttempts` then `dead_lettered`; run each job in an isolated process so one bad payload doesn't kill a worker host |
+| Poller paused (GC) during shard handover | Two pollers dispatch the same shard | Conditional `scheduled → queued` update; duplicates are absorbed by idempotent jobs |
+| Coordination quorum lost | Shard leases can't renew; dispatch pauses | 5-node quorum across 3 zones; alert immediately, since this stops all jobs |
+
+### High availability and disaster recovery
+
+- **SPOFs:** API and pollers are stateless across zones; the executions store and Postgres replicate across 3 zones; the queue is a replicated service; the coordination service is a quorum.
+- **Region strategy:** active-passive. Executions and definitions replicate asynchronously to a standby region. Active-active dispatch would need cross-region shard ownership, which isn't worth its complexity for a 2 s timeliness target.
+- **Targets:** zone loss: **RPO 0, RTO under 1 minute** (shard reassignment). Region loss: **RPO under 1 minute** of execution state, **RTO about 15 minutes**. Recent runs whose `succeeded` status didn't replicate will run again, which at-least-once already allows.
+- **Missed runs:** each job declares a misfire policy (run once to catch up, or skip) so a 15-minute outage doesn't fire fifteen copies of an every-minute cron.
+- **Backups:** Postgres PITR is the critical one: definitions are the source of truth, and future execution rows can be regenerated from them by the reconciler.
+
+### Security
+
+- **AuthN/AuthZ:** users and services authenticate with tokens or mTLS; the owner comes from the token. Authorization covers both job ownership and **task-type registration**: a tenant may only schedule task types its own workers serve.
+- **Worker isolation:** workers authenticate with mTLS and may only lease their registered task types. Otherwise a compromised worker could lease another tenant's payloads.
+- **Payload secrets:** payloads should reference secrets by name (resolved by the worker from a secrets manager), never embed them. Encrypt the `payload` column with envelope encryption and KMS keys rotated on schedule; use TLS on every hop.
+- **Audit:** create, edit, pause, cancel and manual DLQ replays, recording who and when.
+- **Abuse:** per-tenant quotas on active jobs and executions/s, a minimum cron interval, and a cap on `maxAttempts`, so one tenant can't consume the 10k/s budget.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99% of executions start within 2 s of `scheduled_at` (schedule lag), matching the requirement.
+- 100% of due executions are dispatched within 5 minutes, verified by a sweeper counting `scheduled` rows in buckets older than 5 minutes (should be zero).
+- 99.95% of API requests succeed.
+
+**Dashboards:** schedule lag per shard, rows per upcoming bucket (forecasting the `:00` spike), queue depth and age per task type, lease expiries (crashes or timeouts set too short), DLQ rate per task type.
+
+**Tracing:** `execution_id` is the trace root across dispatch, queue, worker and downstream calls.
+
+**Paging:** schedule-lag burn rate, stuck `scheduled` rows, and coordination quorum loss page the platform team. A single task type's failure rate alerts **its owning team**, since it's almost always their code.
+
+### Performance and cost
+
+**Bottleneck:** write amplification on the executions store. Each run writes roughly insert, `queued`, `running` and the final status, so ~4 writes: about 40k writes/s sustained and 120k/s at the `:00` peak. Levers:
+- **Skip the `running` write** and rely on the queue lease. This cuts write volume by about a quarter, but the UI can no longer show "running" precisely.
+- **Batch queue calls.** At 3 calls per execution (send, receive, delete), 864M runs mean ~2.6B queue requests/day; batches of 10 cut that to ~260M. Batching adds a little latency per message.
+
+**Cost drivers:**
+- **History, ~13 TB** for 30 days (more with replicas). Drop time partitions or use row TTL. Moving executions older than 7 days to compressed object storage cuts hot storage by about three quarters, at the cost of slower history queries.
+- **Cross-region replication** of ~432 GB/day of execution writes. Replicating only definitions and future execution rows, not history, cuts most of it; history from the lost region is then gone after failover.
+- **Operational complexity:** a DB, a queue and a coordination service are three systems to run. At much smaller scale, a single Postgres with `SKIP LOCKED` (deep dive) is the cheaper, simpler choice.
+
 ## Follow-up questions
 
 ### Why not just push every job into a delay queue when it's created?

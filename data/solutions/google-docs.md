@@ -201,6 +201,68 @@ VALUES ('d1', 1043, '[{"retain":5},{"insert":"hi"}]', 'cA', 17);
 
 Cursors change on every keystroke but have no long-term value, so they skip the op log entirely. The client sends cursor positions throttled to ~10–20 per second; the server keeps them in memory per doc and broadcasts them. A cursor index must also be transformed: when an op inserts 3 characters before your cursor at 30, every client shifts your displayed cursor to 33 using the same transform rules as a delete or insert position. If a user disconnects, the server removes their cursor after a short timeout.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Op log: a wide-column store (Bigtable/Cassandra-style) keyed `(doc_id, rev)`.** It takes ~1M small appends/s spread over millions of partitions and serves "all ops for this doc after rev R" as one range scan. The only transaction we need is the conditional append that makes `rev` unique and gapless, which is a single-row check-and-set, not a multi-row transaction. A single relational cluster was rejected at this write rate; sharded Postgres would work but buys joins we never use. If you pick Cassandra, the conditional append needs lightweight transactions (Paxos), which are slower; that is acceptable only because one doc's write rate is low.
+- **Metadata and permissions: relational (Postgres or Spanner).** Sharing, ownership transfer and ACL changes are low-volume and need ACID plus secondary indexes ("docs shared with me").
+- **Snapshots: object storage.** Immutable 100 KB blobs, 100 TB total; no reason to pay database prices.
+- **Presence: memory only (BASE, lossy).** A dropped cursor is harmless.
+- **CAP stance:** the op log path is **CP** per document. During a partition, the collab server that can't reach the op log or loses its lease stops acking edits; clients keep typing locally and resend later. That is the right trade for "an acknowledged edit is never lost". Convergence between clients is eventual by design (OT), but the ordering is strong because one sequencer per doc exists.
+
+### Service boundaries and communication
+
+- **Collaboration servers** (stateful, own docs by hash, hold WebSockets), **Doc API** (stateless HTTPS: load, create, history), **Snapshot workers**, **Metadata/permissions service**, **coordination (etcd)**. Collab servers are split from the Doc API because they are stateful and sticky; loading a doc should keep working while collab ownership is moving.
+- **Synchronous:** op append to the op log before ack (durability is the promise); permission check at WebSocket upgrade; doc load.
+- **Asynchronous:** snapshotting and compaction, permission-change notifications to the owning server, and search indexing from the op stream. None are on the keystroke path.
+- **Don't split** transform and sequencing: an extra hop per op would eat the ~100 ms budget.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Collab server crashes | Its docs stop accepting edits for ~10 s (lease expiry) | Ring reassigns docs; clients reconnect with backoff + jitter and resend unacked ops, deduped by `(client_id, clientSeq)`; conditional append fences the old owner |
+| Op log write latency spikes | Acks slow; users see "saving…" | Per-append timeout, retry on the same rev (idempotent); client buffers edits locally; shed new doc opens on that server before slowing active editors |
+| Mass reconnect after a zone outage (millions of sockets) | Load balancer and Doc API swamped | Jittered reconnect, server-advertised retry delay, reconnect with `rev` so only missing ops are sent, not full snapshots |
+| Snapshot worker falls behind | Doc loads replay many thousands of ops; slow opens | Queue snapshot jobs per doc, prioritize hot docs, alert on "ops since last snapshot"; poison docs that fail to replay go to a dead-letter queue for investigation |
+| Transform bug causes divergence | Users see different text | Checksum comparison (see follow-ups), force reload, feature-flag new op types for quick rollback |
+
+### High availability and disaster recovery
+
+- **SPOFs:** a doc's owning server is a deliberate single point per doc, made acceptable by fast lease failover and the fact that clients keep editing locally meanwhile. etcd is a quorum, not a single node. The op log replicates across zones before ack.
+- **Zone vs region:** run each region's collab tier across three zones. Writes for a doc go to one region (its owner), so op log replication across regions is async. A synchronously replicated multi-region store (Spanner-style) gives RPO 0 across regions but adds tens of ms to every ack, so use it only if the business demands it.
+- **RPO/RTO:** **RPO 0 for acknowledged edits within a region**; unacked edits survive in the client buffer. Cross-region **RPO ≤ a few seconds**. **RTO ≤ 30 s** for a server failure (lease plus reconnect) and **≤ 15 minutes** for a region loss.
+- **Backups:** versioned, cross-region snapshots and point-in-time metadata backups target infrastructure loss and bugs; revision history covers user mistakes.
+
+### Security
+
+- **Authn:** short-lived token checked at WebSocket upgrade; long sessions re-validate the token periodically so a revoked user doesn't keep editing for days.
+- **Authz:** owner/editor/commenter/viewer per doc, cached on the owning server and invalidated on change (see follow-ups). Link sharing ("anyone with the link") uses unguessable IDs and can be restricted to a domain for enterprise tenants.
+- **Tenant isolation:** enterprise domain policies (no external sharing, data region pinning) are enforced in the metadata service, never the client.
+- **Encryption:** TLS everywhere; op log and snapshots encrypted at rest with KMS keys rotated on a schedule, optionally customer-managed.
+- **Audit log:** opens, shares, permission changes and exports, for admins. Document content is the PII here, so it never goes into application logs.
+- **Abuse:** per-user op rate limits (a script sending 10k ops/s is cut off), size limits per doc, scanning of publicly shared docs for phishing.
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of ops acknowledged within 300 ms (server-side).
+  - 99% of remote edits delivered to same-region collaborators within 100 ms of ack.
+  - 99.95% of document opens succeed within 2 s.
+  - Zero acknowledged ops lost (checked by reconciling client acks with the op log in canaries).
+- **Dashboards:** append latency per op-log shard, connections per collab server, ownership moves/min, snapshot lag, checksum mismatches.
+- **Traces:** sampled op round trips (send → transform → append → ack → broadcast) and doc opens (metadata, snapshot, replay).
+- **Paging:** burn rate on the ack-latency and open-success SLOs; any spike in checksum mismatches pages, because divergence is silent corruption. A single server's high CPU is not a page if SLOs hold.
+
+### Performance and cost
+
+- **Bottleneck:** op log appends at ~1M/s. Clients already batch keystrokes every 200–500 ms; the server can also group several docs' appends into one batched write per op-log tablet, trading a few ms of latency for throughput. Snapshot every ~1,000 ops keeps load cost bounded.
+- **Op log storage (largest cost):** 8.6 TB/day raw is ~3.1 PB/year, ~9.4 PB with 3× replication if never compacted. Compact ops older than the retained history snapshots and compress them (text ops compress well); the trade-off is coarser revision history for old docs.
+- **Snapshots:** 100 TB of current snapshots plus history snapshots; tier old ones to cold storage, accepting slower opens of rarely used revisions.
+- **Connections:** ~100 collab servers for 10M sockets is modest; disconnecting idle tabs and resuming by `rev` cuts it further, at the cost of a short reconnect.
+- **Cross-region egress:** replicating ~100 MB/s of ops to a second region is ~8.6 TB/day of transfer, a real line item; batching and compressing the replication stream is the lever, traded against a slightly larger cross-region RPO.
+
 ## Follow-up questions
 
 ### What happens when a user goes offline for a few minutes and keeps typing?

@@ -260,6 +260,72 @@ A purge becomes an O(1) operation per server.
 
 Major CDNs advertise global purge times from well under a second to a few seconds; the mechanism above is what makes that possible. Purge APIs are rate-limited per customer, since a "purge everything" storm would send all traffic to origins.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Control plane (Postgres): ACID, CP.** Customer config versions and purge sequence numbers must be strictly ordered and never forked; a purge assigned the same `seq` twice, or a config version half-applied, breaks the catch-up logic in the deep dive. The data is tiny, so Postgres with a synchronous standby is the simple choice. A partition blocks config changes, never serving.
+- **Purge log: durable and replicated.** A customer who received `202` may be purging a leaked file. Losing it means serving that file until TTL, so the purge is replicated before the API responds.
+- **Edge caches: AP by design.** Serving a possibly stale object is the product's whole value; `stale-if-error` explicitly chooses availability over freshness. Purges are eventually consistent but bounded: "complete" means every POP acknowledged.
+- **Analytics (ClickHouse via Kafka): BASE.** Columnar storage suits "sum bytes per customer per minute" over billions of rows. Postgres can't ingest millions of rows per second; a search engine costs far more for numeric aggregates. Dashboards can lag a minute, but these numbers drive **billing**, so data may be late but never dropped.
+- **TLS private keys:** a strongly consistent, access-controlled secret store, distributed only to POPs that need them.
+
+### Service boundaries and communication
+
+- **Data plane** (edge and shield cache servers), **control plane** (config and purge APIs), **distribution bus** (relays), **routing control** (DNS mapping, BGP announcements, health checks) and **log pipeline** are separate systems with separate release trains.
+- The key rule: **the data plane never calls the control plane synchronously.** POPs serve from their last config snapshot if the control plane, the bus or analytics are unreachable.
+- **Synchronous:** user → edge → owner server → shield → origin, each hop with its own timeout. **Asynchronous:** config and purge distribution with acknowledgements, log shipping in batches, and health signals feeding DNS and BGP decisions.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Customer origin slow or down | Misses hang; shield connections pile up | Origin timeouts, coalescing, `stale-if-error`; a circuit breaker per origin so edges serve stale or fail fast; per-origin connection caps at the shield (bulkheads) so one slow customer can't exhaust shield capacity for everyone |
+| Shield POP lost | Edges' misses lose their coalescing tier; origin load can jump from ~100k to ~500k req/s | Assign each origin a secondary shield; edges fail over to it rather than going direct; rate-limit direct-to-origin fetches |
+| Bad config pushed globally | Every POP misbehaves at once | Canary POPs and staged rollout (follow-ups), automatic halt when canary errors or hit ratio move, one-command rollback to the previous version |
+| "Purge everything" or purge storm | Hit ratio collapses, origins flooded | Purge rate limits per customer; **soft purge** (mark stale, then revalidate) so unchanged objects come back as cheap `304`s; coalescing at the shield |
+| Cache-busting attack (random query strings) | Every request is a miss to the origin | Drop unknown query parameters per customer rules; rate-limit misses per client IP; WAF rules |
+| Log pipeline backs up | Analytics and billing lag | Servers buffer logs on local disk and never block serving; pipeline replays when Kafka recovers |
+
+### High availability and disaster recovery
+
+- **No SPOF on the request path:** anycast across ~200 POPs, ECMP across load balancers inside each POP, and a consistent-hash ring that loses only ~1/20 of a POP's cache when a server dies.
+- **POP or region loss:** withdrawal moves traffic in seconds (**RTO ≈ seconds**, with somewhat higher latency); shields absorb the colder caches.
+- **Control plane:** runs in two regions with a synchronous standby for config and the purge log. **RPO 0 for config versions and acknowledged purges. RTO under ~5 minutes for the purge API**, because purging leaked or illegal content is an incident-response tool.
+- **Backups:** point-in-time recovery for the control-plane DB, plus each POP's last-known config snapshot. Cached content is never backed up; the origin is the truth.
+- **Billing data:** disk-buffered logs and replicated Kafka, reconciled daily against per-server byte counters.
+
+### Security
+
+- **Tenant isolation:** the hostname is always part of the cache key, so one customer can never be served another's object. Guard against **cache poisoning**: never let unkeyed request headers (e.g. `X-Forwarded-Host`) influence a cacheable response.
+- **Domain verification** before accepting a hostname; otherwise anyone could claim `static.shop.com` and serve content for it.
+- **Control-plane authn/authz:** dashboard with SSO and MFA; API tokens scoped per zone and per action (a CI token that can only purge).
+- **TLS keys:** encrypted at rest, sent only to POPs that serve the hostname. Certificates renew automatically and old keys are revoked after rotation.
+- **Audit:** every config change, purge, certificate upload and staff access to customer settings.
+- **PII:** access logs hold client IPs and full URLs, which can contain tokens. Truncate IPs for analytics, strip known secret parameters, set short retention for raw logs, and encrypt customer log delivery.
+- **Abuse:** takedown process for customers hosting phishing or malware; per-IP edge rate limiting; origin protection (follow-ups).
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.99% of edge requests served without a CDN-caused 5xx (origin errors are tracked separately and shown to the customer).
+- 99% of cache hits served within 10 ms of server time.
+- 99% of purges acknowledged by all POPs within 5 s.
+
+Server timing misses the network, so add **synthetic probes and real-user timing** from many ISPs.
+
+**Dashboards:** per-POP requests, bandwidth and hit ratio by tier; origin latency and errors per customer; config version skew; purge lag per POP; BGP announcement state; TLS handshake failures; disk health. **Tracing:** a request ID carried edge → owner → shield → origin, with cache status at each hop in a debug header. **Paging:** burn rate on availability globally and per POP, purge-lag SLO, and a sudden global hit-ratio drop (the symptom of a bad cache-key rule). A customer's broken origin notifies that customer, not the CDN on-call.
+
+### Performance and cost
+
+**Bottleneck: per-server network and TLS.** Zero-copy sends from page cache, TLS session resumption and HTTP/2 or HTTP/3 reuse, a memory tier for hot objects, and admission control so one-hit wonders don't churn SSDs. Shields keep pooled keep-alive connections to origins. Brotli for text cuts bytes at some CPU cost.
+
+**Cost drivers:**
+- **Bandwidth: ~1 TB/s (8 Tbps) at peak** dominates everything. Settlement-free peering at exchanges and servers placed inside ISP networks replace paid transit, at the cost of many more small sites to operate.
+- **Edge storage:** ~100 TB × 200 POPs ≈ 20 PB of SSD. More disk raises hit ratio with diminishing returns; leave the long tail to shields.
+- **Origin egress (the customer's bill):** misses at ~100 KB each mean ~50 GB/s from origins without a shield and ~10 GB/s with one. The shield's price is an extra hop on misses and its own capacity.
+- **Logs:** 10M req/s × ~200 bytes ≈ 2 GB/s, about 170 TB/day. Aggregate per customer per minute at the edge for dashboards, ship full logs only to customers who buy log delivery, and bill from exact byte counters rather than sampled logs.
+
 ## Follow-up questions
 
 ### How do you handle TLS for millions of customer hostnames?

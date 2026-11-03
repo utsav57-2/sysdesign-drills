@@ -240,6 +240,66 @@ A guest clicks "Book", the request times out on a flaky connection, and the app 
 
 **How the geo part works:** each property stores a geohash (e.g. a 6-character cell ≈ 1.2 km × 0.6 km). Elasticsearch's `geo_point` type with a `geo_distance` filter does the cell lookup and exact distance check internally; for map views, a `geo_bounding_box` filter on the visible map area. Popular queries (Paris, next weekend, 2 guests) can be cached for ~30 s.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Inventory and reservations: Postgres sharded by `hotel_id` (ACID).** A booking is a multi-row conditional update (one row per night) plus a reservation insert with a unique idempotency key, all-or-nothing. That is exactly what a relational transaction gives on one shard. A key-value store like DynamoDB can do this only with its transaction API and its size limits, and Cassandra's lightweight transactions are single-partition and slow; both were rejected because the whole product promise is "never double-book". At ~120 bookings/s peak over 1.8B rows, throughput is not a reason to leave Postgres.
+- **Search: Elasticsearch, availability: Redis, both BASE.** Both are fed by CDC and lag by seconds, which the requirements explicitly allow. Staleness costs a rare 409 at reservation time, never a double booking.
+- **"My trips" store keyed by `user_id`:** an eventually consistent projection (see follow-ups); the confirmation itself comes from the reservation service, so a few seconds' lag is harmless.
+- **CAP stance:** the reserve path is **CP**: if a hotel's shard primary is unreachable, return 503 for that hotel's bookings rather than accept them on a replica that might diverge. Search and hotel pages are **AP**: show possibly stale availability rather than nothing, because a search outage loses far more revenue than an occasional 409.
+
+### Service boundaries and communication
+
+- **Search** (read-heavy, ~5k/s peak, scales with replicas), **Hotel service** (property pages), **Reservation service** (the only writer of `reserved`), **Host management**, **Payment service**, **Indexer** and **Notifications**. The key boundary is that only the reservation service and host management write inventory, and both use conditional updates; search never touches Postgres.
+- **Synchronous:** search and hotel reads; reservation → Postgres; reservation → payment (the guest is waiting for "confirmed" or "declined", and the room is held as `pending` meanwhile).
+- **Asynchronous:** CDC → Kafka → indexer (search index, availability cache), notifications, "my trips" projection, channel-manager pushes to Expedia and others. These lag tolerably and must not block a booking.
+- **Not split further:** inventory and reservations stay in one service and one shard because separating them would turn every booking into a distributed transaction.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Payment provider times out | Reservation stuck `pending` with nights held | 5–10 s timeout, idempotent retry with `reservation_id` as provider key and backoff + jitter; circuit breaker returns "try again shortly"; the sweeper releases holds after `held_until` |
+| Shard primary fails during a booking | Transaction aborts; client sees an error | Failover to a synchronous standby; client retries with the same `Idempotency-Key`, so it either gets the committed reservation or books afresh |
+| CDC/indexer lag | Search shows rooms that are sold out | Bounded staleness alert on CDC lag; reservation re-checks live inventory; during long lag show "availability may have changed" |
+| Elasticsearch overloaded during a city event | Slow or failed searches | Cache popular query results ~30 s, shed expensive filters first, separate thread pools (bulkheads) for search and property pages so one can't starve the other |
+| Channel-manager push fails | External site sells a night we just sold | Retries with backoff, then a dead-letter queue with alerting; per-channel inventory allocation or buffers to absorb sync delay |
+
+### High availability and disaster recovery
+
+- **SPOFs:** each shard primary (synchronous standby in another zone, automatic failover), the CDC pipeline (Kafka replicated across zones, connector restarts from its stored log position), the sweeper (leader election).
+- **Zone vs region:** multi-zone in a primary region plus an async-replicated warm standby region. Active-active booking writes were rejected: they would need cross-region locking or risk double-booking.
+- **RPO/RTO:** reservations **RPO 0** within a region (a lost confirmed booking means a guest arrives with no room) and **≤ 1 minute** across regions, with a reconciliation against payment provider records to recover anything lost in that window. **RTO ≤ 5 minutes** for a zone, **≤ 30 minutes** for a region; search can stay up throughout.
+- **Backups:** snapshots plus WAL archiving for point-in-time recovery, with restore tests; Elasticsearch and Redis are rebuilt from Postgres.
+
+### Security
+
+- **Authn:** guest and host accounts with separate scopes; host staff can have sub-roles (front desk vs revenue manager).
+- **Authz and tenant isolation:** a host may only edit inventory for hotels they own; every host API checks `hotel_id` ownership server-side. Guests can only read and cancel their own reservations.
+- **PII:** names, emails, phone numbers and payment tokens. Card data stays with the payment provider (we store `provider_ref`); encrypt guest contact fields at rest, and share them with the hotel only for confirmed stays.
+- **Encryption and secrets:** TLS everywhere, KMS-managed at-rest keys with rotation; payment and channel-manager credentials in a secret manager.
+- **Audit log:** price and inventory changes by hosts, cancellations, refunds and support-agent overrides, with actor and time, for disputes.
+- **Abuse:** rate limits per user and IP on reservations, and holds per user capped (a bot creating thousands of `pending` holds could block a hotel's inventory). Scraping of prices is limited with per-client search quotas.
+
+### Observability
+
+- **SLIs/SLOs (30 days):**
+  - 99.9% of reservation requests get a final answer (confirmed, 409 or 402) within 3 s.
+  - Zero nights booked beyond the configured limit, checked by a nightly audit query against the `CHECK` invariant.
+  - 99.9% of searches return within 500 ms (the p99 requirement).
+  - 99% of inventory changes reflected in the availability cache within 5 s.
+- **Dashboards:** bookings/s and 409 rate by city, payment success and latency, pending hold count and age, CDC lag, search latency.
+- **Traces:** the reserve path (reservation → Postgres → payment → confirm) on every error and a sample of successes; search fan-out.
+- **Paging:** burn rate on the reservation and search SLOs, and any oversell found by the audit. A 409 spike alone is not a page (it may be a sell-out).
+
+### Performance and cost
+
+- **Bottleneck:** search, not booking. 5k searches/s each check hundreds of hotels across several nights. Store availability in Redis as one compact value per room type with a byte or small integer per night (5M room types × 365 nights ≈ 1.8 GB), so a page of results is one pipelined read. Keep Elasticsearch shards sized to fit in memory and filter before scoring.
+- **Search cluster cost:** the largest line item, because replicas scale with query rate, not data size (1M properties is a small index). Caching popular queries for ~30 s cuts replicas needed at peak, at the cost of slightly staler results.
+- **Database cost is modest:** ~90 GB of inventory plus ~365 GB/year of reservations. Archive completed reservations older than a year or two to cheap storage, and drop inventory rows for past dates.
+- **Cross-region replication** is small (~1 GB/day of reservations plus inventory churn), so a standby region is cheap insurance. The bigger hidden cost is operating shards; at this data size a few large shards beat many small ones.
+
 ## Follow-up questions
 
 ### How does overbooking work operationally, and what happens if everyone shows up?

@@ -102,13 +102,32 @@ func diagramBlock(png string) (anthropic.BetaContentBlockParamUnion, bool) {
 
 // ---- Feedback ----
 
+// seniorChecklist is what a senior candidate is expected to raise without being asked.
+// Both the interviewer and the grader use it.
+const seniorChecklist = `
+Beyond the core design, a senior candidate is expected to raise these without being prompted, where they matter for this problem:
+- Scale estimation that actually drives decisions (QPS, read/write ratio, storage growth, bandwidth, peaks).
+- API details: pagination, versioning, authentication and authorization, idempotency, error handling.
+- Data: access patterns and indexes, normalization vs denormalization, and a reasoned database choice (relational vs NoSQL, ACID vs BASE).
+- Consistency: which parts need strong consistency and which can be eventual, justified by the business (CAP).
+- Communication: why each interaction is synchronous or asynchronous, and why services are split where they are.
+- Reliability: timeouts, retries with backoff, idempotency, circuit breakers, dead-letter queues, bulkheads, graceful degradation.
+- High availability: no single points of failure, failover, multi-zone or multi-region, backups, RPO and RTO.
+- Security: authn/authz, encryption in transit and at rest, secrets and key rotation, audit logs, rate limiting and abuse.
+- Observability: metrics, logs, traces, SLIs and SLOs, alerting.
+- Performance and cost: batching, caching, compression, connection pooling; storage, replication and cross-region costs.
+- Trade-offs: every major choice should name what it gives up.
+`
+
 const feedbackSystem = `You are a senior staff engineer grading a system design interview, in the style of a FAANG onsite.
 The candidate worked through a standard delivery framework: requirements, core entities, API design, high-level design (a whiteboard diagram plus notes), and deep dives.
 Grade against what is expected of a mid-to-senior (L5/E5) candidate. Be specific and concrete: reference what the candidate actually wrote or drew, name the exact technologies or techniques they should have used, and explain why.
 Empty sections should get low scores and say what was expected. Do not invent content the candidate did not provide.
 Scores are integers from 1 (missing or wrong) to 10 (exceptional).
 When a reference solution is provided, use it as the answer key for what a strong answer covers, but give full credit for different approaches that are well reasoned and correct.
-missedConcepts lists glossary concept IDs the candidate should have used or explained better; leave it empty if they covered everything important.`
+missedConcepts lists glossary concept IDs the candidate should have used or explained better; leave it empty if they covered everything important.
+Score the checklist below mostly in deep dives. Name the specific items the candidate skipped that matter for this problem, and do not penalize items that are irrelevant to it.
+` + seniorChecklist
 
 // feedbackSchema constrains missedConcepts to glossary IDs so weak areas can be tracked over time.
 func feedbackSchema(conceptIDs []string) map[string]any {
@@ -201,7 +220,8 @@ const interviewerBase = `You are an experienced system design interviewer.
 Behave like a real interviewer: keep replies short (usually 1-4 sentences), answer clarifying questions about scope and scale with realistic numbers, and probe the candidate's decisions with follow-up questions ("What happens when...?", "Why X over Y?", "How does this scale to...?").
 Do not hand over the solution or design the system for them. If they are stuck, give a small hint. If they ask for a full answer outright, remind them this is practice and nudge them toward the next step instead.
 Each candidate message starts with a status line (elapsed time and the stage they have open) and a snapshot of their written workspace, sometimes with their whiteboard diagram. Refer to it naturally rather than repeating it.
-`
+Use the checklist below to choose probes. If the candidate never brings up security, failure handling, observability or cost, ask about the ones that matter most for this problem, one at a time, the way a real interviewer would. Don't recite the list.
+` + seniorChecklist
 
 const practiceMode = `
 The candidate is practicing at their own pace and leads the conversation. Respond to what they ask; don't push them through stages unless they ask what to do next.
@@ -212,7 +232,7 @@ This is a timed mock interview and you lead it, the way a real interviewer would
 requirements ~5 min, core entities ~2 min, API ~5 min, high-level design ~15 min, deep dives ~10 min.
 - On the first message, briefly introduce the problem in one or two sentences and ask the candidate to start with requirements.
 - Keep the candidate moving. When a stage is good enough, or its time is up, say so and move them to the next stage.
-- In deep dives, pick the one or two most important weaknesses in their design and press on them.
+- In deep dives, pick the one or two most important weaknesses in their design and press on them. If time allows, also ask how the system fails, how it's secured, and how they'd know it's healthy.
 - Around 37 minutes, wrap up: thank them and tell them to press "Get feedback" for their scored review.
 - Whenever you move the candidate to a different stage, end your message with a final line of exactly "STAGE: <id>", where <id> is one of requirements, entities, api, highLevel, deepDives. The app hides this line and switches the candidate's view. Never mention it.
 `

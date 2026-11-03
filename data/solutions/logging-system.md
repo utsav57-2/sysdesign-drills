@@ -219,6 +219,76 @@ The query service checks the time range and only fans out to tiers that overlap 
 - Results are sorted by timestamp descending and use `search_after` for pagination.
 - Live tail is a separate Kafka consumer that filters the stream and pushes matches over SSE, so tailing doesn't load the index.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Kafka** is the durable buffer and the point of acknowledgment: the write path needs replayable, high-throughput appends, not queries.
+- **Elasticsearch/OpenSearch for the hot tier**, because the core query is free text plus filters over recent data, which needs an inverted index. A relational DB rejects 1M rows/s with B-tree maintenance and has weak full-text support. A wide-column store (Cassandra) handles the writes but can't do ad-hoc text search.
+- **Object storage for the cold tier:** 1.6 PB of rarely read data doesn't belong on block storage.
+- **Postgres for retention policies and legal holds.** This is the only data that needs ACID: the lifecycle manager must read a committed legal-hold flag before deleting anything, and a half-applied policy update could delete a year of data.
+- **CAP per path:** ingest is **AP**: always accept and buffer, because a log you refuse during an incident is gone forever. Search is **BASE**: lines show up after the refresh, a replica may lag slightly, and a query with a timed-out shard returns partial results marked as such. Deletion is **CP**: if the policy store is unreachable, the lifecycle manager skips deletes rather than guess.
+
+### Service boundaries and communication
+
+- **Ingest gateway** is stateless and split from Kafka so that auth, quotas and tenant stamping happen in one place, and agents never hold Kafka credentials.
+- **Indexer, archiver and tail** are separate consumer groups on the same topics. They fail and scale independently, so an Elasticsearch outage never stops archiving, and the archive (not the index) is the long-term source of truth.
+- **Sync vs async:** agent → gateway → Kafka is synchronous up to the `acks=all` ack, since that ack is the durability promise. Everything after Kafka is async. Search is synchronous with per-shard timeouts; cold-tier searches become async jobs, because minutes-long scans don't belong on an HTTP request.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Hot cluster slow or rejecting bulks (429) | Kafka lag grows, freshness misses 5 s | Indexers back off with jitter and a circuit breaker on bulk errors; Kafka's 24 h buffer absorbs it (deep dive example); UI shows "indexed up to T" |
+| Incident burst at 5× (2.5 GB/s raw) | Gateway and indexers saturate | Autoscale stateless gateways; per-tenant quotas return 429; shed by priority (DEBUG first) at agents; agents buffer to disk |
+| Malformed line or mapping conflict | Bulk returns partial failures; retrying the whole batch loops forever | Retry only failed docs, then send them to a DLQ topic with the error |
+| One `(tenant, service)` partition flooded | Single indexer lags while others idle | Add a host-hash suffix to the partition key for large services, since order only matters per host; quota the tenant |
+| Expensive query (leading wildcard over 7 days) | Heap pressure on hot nodes slows indexing | Query timeouts and result limits; dedicated coordinating nodes and separate search/write thread pools as a bulkhead |
+| Zone outage | One copy of some shards and one Kafka replica lost | Zone-aware shard allocation keeps primary and replica in different zones; Kafka rack-aware RF 3 |
+
+### High availability and disaster recovery
+
+- **SPOFs:** gateways sit behind a load balancer across 3 zones; Kafka spans the zones; each hot shard has a replica in another zone; Postgres has a standby with automatic failover; the lifecycle manager runs with leader election so only one instance deletes.
+- **Region strategy:** run one pipeline **per region** and keep logs in-region. That suits data residency and avoids shipping 43 TB/day across regions; a regional outage takes that region's services down too, so its log search can lag. Archive buckets replicate to a second region.
+- **Targets:** zone loss: **RPO 0** for acked lines, **RTO under 5 minutes** for search. Region loss: other regions are unaffected. The lost region's archive **RPO is about 1 hour** (the hourly archive files), and **RTO for search over recovered history is hours**, rebuilt from the archive. Ingest gets the stricter target because a lost line can't be regenerated.
+- **Backups:** Elasticsearch snapshots to object storage and Postgres point-in-time recovery. Shortening a retention policy needs two-person approval, since a bad rule is the most likely way to lose data.
+
+### Security
+
+- **AuthN:** ingest tokens per tenant with write-only scope, delivered to agents by a secrets manager and rotated with an overlap window. Engineers sign in through SSO.
+- **AuthZ:** RBAC per tenant/service. The query service injects the tenant's index pattern and filters server-side, and never trusts a filter from the client.
+- **Encryption:** TLS on every hop; encrypted disks on Kafka and Elasticsearch nodes; KMS-encrypted buckets with key rotation.
+- **PII:** scrub at the agent (see retention deep dive). Mask sensitive fields such as `user_email` for roles without need-to-know.
+- **Audit:** searches are themselves sensitive, so record who queried what in an append-only audit store separate from tenant indices.
+- **Abuse:** byte quotas at ingest (follow-up), plus per-user query rate and cost limits so one dashboard can't hammer the hot tier.
+
+### Observability
+
+The pipeline's own telemetry goes to a separate metrics stack, never to itself.
+
+**SLIs and SLOs (30 days):**
+- 99.95% of in-quota agent batches get a 202.
+- 99% of lines searchable within 5 s, measured by canary lines injected every 10 s per region.
+- 99% of hot-tier queries over ≤ 1 hour return within 2 s.
+- Zero canary lines lost.
+
+**Dashboards:** Kafka lag per consumer group (in seconds), bulk rejections, indexing rate vs ingest rate, JVM heap and GC, fleet-wide agent disk-buffer usage, and per-tenant ingest vs quota.
+
+**Tracing:** query fan-out per shard, plus sampled ingest batches.
+
+**Paging:** freshness and ingest-error burn rates, and missing canaries. Hot-node heap alerts open tickets, not pages.
+
+### Performance and cost
+
+**Bottleneck:** indexing CPU on the hot tier. Tune with 5–15 MB bulks (deep dive), explicit mappings that skip unused fields, and a refresh interval of 2–3 s instead of 1 s, which cuts segment churn but stays inside the 5 s target. Gateways keep pooled, long-lived Kafka producers.
+
+**Cost drivers and levers:**
+- **Hot tier, ~600 TB SSD.** Cutting it from 7 to 3 days gives 43 × 3 × 2 ≈ 258 TB, saving ~340 TB, but days 4–7 move to slower warm nodes.
+- **Volume.** Dropping DEBUG logs that make up, say, 30% of lines cuts every tier by 30%. The trade-off is less detail when debugging.
+- **Cold tier, 1.6 PB.** Infrequent-access or archive storage classes are cheaper per GB but add retrieval fees and latency.
+- **Cross-zone traffic.** Elasticsearch replicas receive about the full 43 TB/day raw, and Kafka replication adds about 17 TB/day (2 followers × 8.6 TB). That's the price of zone durability; in-region queries avoid cross-region egress.
+- **Operational complexity.** A ~600 TB Elasticsearch fleet needs real expertise; a managed service or Loki-style design trades price or search speed for less toil.
+
 ## Follow-up questions
 
 ### How do you stop one noisy service from overwhelming the pipeline?

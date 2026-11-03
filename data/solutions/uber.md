@@ -183,6 +183,60 @@ Internally `GEOSEARCH` does the 9-cell lookup and distance filtering for you.
 - Compute supply (available drivers) and demand (requests) per H3 cell over the last few minutes in a stream processor, then derive a multiplier, smoothed so it doesn't flap.
 - The fare quote locks the surge multiplier until `expires_at`, so the rider pays what they were shown.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Rides and fares: Postgres, ACID.** The ride state machine, the conditional `UPDATE ... WHERE status='offered'`, and flipping the driver to `on_trip` in the same transaction are exactly what relational transactions are for. At ~120 rides/s (≈1.2k/s at peak) and roughly 10 GB/day of ride rows, a regional Postgres cluster sharded by city handles it. Cassandra/DynamoDB-style stores were rejected here: their conditional writes are per-key, and you'd be rebuilding a two-row transaction (ride + driver) by hand.
+- **Driver locations: Redis GEO, BASE.** 200k overwrites/s of data that is useless after ~10 s. If a Redis node loses the last few seconds, drivers repopulate it on their next 5 s ping. Durability would be wasted money.
+- **Driver locks: Redis with TTL.** Good enough as a fast *pre-filter* because the Postgres conditional update is the real source of truth. If a lock is lost on failover and two matchers offer the same driver, the second accept fails the conditional update and the ride goes back to `requested`. Annoying, not harmful.
+- **Trip location history: Kafka → data lake.** Append-only, analytical, eventually consistent.
+- **CAP:** matching and payment are **CP**: if a city's Rides DB primary is unreachable, refuse new ride requests in that city rather than risk double-assignment or double-charging. Location reads and the rider's map are **AP**: a stale car icon is fine. Fare quotes are AP-ish too, since the quote stores its own price and `expires_at`.
+
+### Service boundaries and communication
+
+- **Location service** is split out because its load profile (200k writes/s, tiny payloads, no transactions) is nothing like the Ride service's (~1k/s, transactional). Scaling them together would size Postgres for location traffic.
+- **Matching** is separate from Ride because it's a long-running, timer-driven workflow per request and needs per-city isolation.
+- **Fare and Routing/ETA** are separate because routing is CPU-heavy graph search with its own scaling.
+- **Synchronous:** `POST /fares` (calls Routing with a tight ~300 ms timeout), `POST /rides` (writes the DB and returns `requested`), and accept/decline. **Asynchronous:** the match queue (so a 1-minute matching process never holds an HTTP request), offers via WebSocket/push, trip locations to Kafka, payment capture and receipts.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Routing/ETA service slow or down | Fare quotes and driver ranking stall | Timeout ~300 ms, circuit breaker; fall back to straight-line distance × city speed factor for ranking and a conservative cached fare table, flagged in logs |
+| Redis GEO shard for a city fails | No candidates found, matching stalls in that city | Replica promotion (seconds); drivers repopulate on next ping; matcher retries with backoff + jitter rather than failing the ride |
+| Matcher crashes mid-offer | Ride stuck in `offered` | Durable workflow (Temporal or DB-persisted state) resumes; lock TTL (10 s) frees the driver automatically |
+| Push/WebSocket delivery fails | Driver never sees the offer | Offer timeout moves to the next driver; dual delivery (WebSocket + APNs/FCM) |
+| Payment provider outage | Can't authorize at request time | Bulkhead payment calls (own thread pool) so they can't exhaust Ride service workers; allow trusted riders to ride on a deferred authorization, retry capture idempotently with `ride_id`, park permanent failures in a DLQ for review |
+| New Year's Eve spike in one city | Queue backlog, slow matching | Per-city partitions isolate it; surge pricing; shed fare-estimate load before ride requests |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the Postgres primary per city shard (fix: synchronous replica in another zone with automatic failover), the API gateway (multiple instances across zones), and the match queue (replicated partitions).
+- **Zones vs regions:** each region runs across 3 zones. Cities are homed in one region, which keeps matching strongly consistent without cross-region consensus. On a full region loss, cities fail over to a warm standby region with an asynchronously replicated Rides DB.
+- **What's lost on regional failover:** Redis GEO is not replicated cross-region; drivers repopulate it within one 5 s cycle. In-flight offers time out and retry.
+- **RPO/RTO:** Rides DB: RPO 0 within a region (sync replica), RPO under ~5 s cross-region; RTO under 1 minute for a zone, ~5–15 minutes for a region. Justification: a rider stranded for 15 minutes is bad, but a lost completed-trip record means unbilled rides and driver pay disputes. Backups: daily snapshots plus continuous WAL archiving for point-in-time recovery from bad writes.
+
+### Security
+
+- **Authn/authz:** OAuth tokens for riders and drivers; `rider_id`/`driver_id` come from the token. Authorization is relationship-based: only the assigned driver can `accept` or `complete` ride X, and only that rider and driver can see each other's location, and only while the ride is active.
+- **PII:** live location is the most sensitive data here. Encrypt in transit (TLS everywhere, mTLS between services) and at rest; restrict trip history access by role and audit every internal lookup of a rider's trips. Mask phone numbers with a relay so rider and driver never see the real numbers.
+- **Payment:** store only provider tokens, never card numbers, to keep most of the system out of PCI scope.
+- **Abuse:** GPS spoofing (see follow-up), fake ride requests to tie up drivers (rate-limit per account and device, cancellation fees), and fare-quote scraping (rate-limit `POST /fares`). Secrets and DB credentials live in a secrets manager with automatic rotation.
+
+### Observability
+
+- **SLIs/SLOs:** 99% of ride requests reach `accepted` or a clear "no drivers" answer within 60 s (the product requirement). Zero double-assignments, measured by a reconciliation job; any hit is a sev-1. 99.9% of location updates visible to matching within 2 s. 99.9% of `POST /fares` succeed within 500 ms.
+- **Dashboards:** per-city match rate, time-to-match, offer acceptance rate, queue depth, Redis write rate and memory, driver count by status, surge multiplier per H3 cell.
+- **Tracing:** one trace per ride from `POST /rides` through queue, each offer, accept and payment; this is how you debug "why did my match take 3 minutes".
+- **Paging:** burn rate on time-to-match per city and on ride-request errors. A Redis replica failing over without user impact is not a page.
+
+### Performance and cost
+
+- **Bottleneck:** the 200k location writes/s. Each is a tiny `GEOADD`; 1M drivers × ~100 bytes is only ~100 MB of memory, so the cost is ops/s and connections, not RAM. Batch updates per gateway connection (pipeline many `GEOADD`s per round trip) and use adaptive reporting; going from 5 s to 10 s while parked can cut writes substantially, at the cost of slightly staler idle-driver positions.
+- **Location history:** if every update went to Kafka, 200k/s × ~100 bytes ≈ 20 MB/s ≈ 1.7 TB/day, ~5 TB/day with replication factor 3. Only stream on-trip updates, compress (location batches compress well), and keep short Kafka retention with the data lake as the long-term store. Trade-off: less data for ETA models from idle drivers.
+- **Routing calls** are the biggest compute cost. Rank by straight-line distance first and compute road ETAs for the top ~10 only; cache ETAs per H3 cell pair for a minute. Trade-off: slightly worse ranking accuracy.
 ## Follow-up questions
 
 ### How do you rank candidate drivers? Is the nearest always best?

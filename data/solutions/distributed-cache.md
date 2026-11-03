@@ -212,6 +212,71 @@ Hot-key detection: the client samples requests and keeps a count-min sketch or t
 
 **The remaining race:** reader R misses and reads old value v1 from the DB; writer W updates the DB to v2 and deletes the key; then R writes v1 into the cache. The cache is stale until the TTL. Fixes: always set a TTL, delete again after a short delay ("delayed double delete"), or use leases. Facebook's memcache paper describes **leases**: on a miss the server hands out a token, and a `set` is accepted only with a still-valid token; a `delete` invalidates outstanding tokens, so R's late write is rejected. Leases also limit the **thundering herd**: only one client per key gets a token at a time, while others wait briefly and retry.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **An in-memory key-value store** is the only thing that hits ~1 ms p99 at 1M ops/s. Disk-backed KV stores and relational databases add milliseconds of I/O and query overhead that defeat the purpose.
+- **The source database owns ACID; the cache is BASE.** Replication is async, cache-aside leaves stale windows bounded by the TTL, and a failover can drop seconds of writes. That's fine because every entry can be regenerated.
+- **Decide what must bypass the cache.** Reads that drive money or security (balance at checkout, a revoked permission, an inventory decrement) go to the database or use very short TTLs with explicit invalidation. Product pages and profiles tolerate seconds of staleness.
+- **CAP stance: AP.** Clients prefer an answer now, and on a cache error they treat it as a miss and fall back to the database. Majority voting on failover prevents split-brain *promotions*, but it doesn't make the cache linearizable, and nothing should rely on it as a lock of record without fencing.
+
+### Service boundaries and communication
+
+- **Smart client vs proxy:** the smart client hashes straight to the owning node, avoiding a hop that would eat a large part of the 1 ms budget. A proxy (follow-up) is worth it only when there are many languages or very high connection counts.
+- **Shared vs per-domain clusters:** one shared 40-node cluster gets the best memory utilization, but one team's hot key or `KEYS *` then hurts everyone. Split clusters by domain or criticality (session cache vs recommendations) as a bulkhead, accepting some stranded memory.
+- **Sync vs async:** `GET`/`SET` are synchronous with tight client timeouts (a few ms). Replication is async. Invalidation is synchronous `DEL` after the DB write for single-service data, and async through CDC when many services write the same tables (deep dive).
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Primary crash | 1/20 of keys unreachable for ~15–30 s; ~45k reads/s (1/20 of ~909k) fall through to the DB | Fast replica promotion; client timeouts treat errors as misses; request coalescing so each key is fetched once; read from replicas meanwhile |
+| Whole cluster cold or down | DB receives up to ~909k reads/s and falls over | Rate-limit miss traffic to the DB, shed non-critical reads (recommendations off), serve stale from near caches, warm before cutover (follow-up) |
+| Slow node (huge value, `KEYS`, swapping) | p99 spikes for that shard | Per-node timeouts and circuit breakers; block dangerous commands via ACLs; cap value size in the client; no swap on cache hosts |
+| Popular key expires | Stampede on the DB | Locks, early refresh and TTL jitter (follow-up) |
+| Hot key | One node's CPU/NIC saturates | Near cache or key splitting (deep dive) |
+| CDC invalidation consumer lags | Stale reads beyond expectations | TTL as the safety net; alert on consumer lag in seconds |
+
+### High availability and disaster recovery
+
+- **SPOFs:** every primary has a replica **in a different zone**, and primaries are spread across 3 zones. Losing a zone takes out ~7 of 20 primaries, leaving 13 of 20, still a majority to vote promotions, and every affected shard has its replica elsewhere.
+- **Zone loss capacity:** after promotion the shard count is unchanged, but those shards run without replicas until rebuilt. Rebuilding is a full sync of ~50 GB per replica, so throttle resyncs to protect the 1 ms p99.
+- **Region:** one independent cluster per region (follow-up). After a regional failover, the surviving region's cache is cold for the moved users, so its DB must be sized for the extra misses, or the cache pre-warmed.
+- **Targets:** **RTO 10–30 s** per node (the requirement) and **RPO of a few seconds of writes**. The real RPO is that of the source database: the cache's data is always rebuildable, so what matters is how fast the DB can absorb the refill.
+- **Backups:** not needed for correctness. Optional RDB snapshots let a node restart warm, at the cost of fork-time latency spikes on 50 GB processes.
+
+### Security
+
+- **AuthN/AuthZ:** Redis ACL users per service, restricted to their key prefix patterns and to safe commands (no `FLUSHALL`, `KEYS` or `CONFIG`). Passwords come from a secrets manager and rotate by adding a new ACL password before removing the old one.
+- **Network:** cache nodes live in a private subnet reachable only from app servers. TLS protects data in transit but costs CPU and some latency, so measure against the 1 ms budget; it's required where cached data includes PII.
+- **At rest:** snapshot/AOF files sit on encrypted volumes.
+- **PII:** cached copies extend PII lifetime, so a user deletion must also delete their keys (the TTL bounds the worst case). Never cache raw secrets or session tokens; cache by token hash.
+- **Audit:** admin commands, ACL changes and failovers.
+- **Abuse:** cap clients per node and value size per request, so one misbehaving service can't exhaust connections or a NIC.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.9% of client operations succeed (no timeout or error).
+- p99 client-side latency ≤ 1 ms in 99.5% of 5-minute windows.
+- Hit ratio above the level the DB can absorb. With ~909k reads/s and an assumed DB budget of 100k reads/s, misses must stay under ~11%, so hits above ~89%.
+
+**Dashboards:** hit ratio per keyspace, evictions/s, used memory vs `maxmemory`, fragmentation ratio, ops/s and network per node (to find hot shards), replication offset lag, connected clients, slow log.
+
+**Tracing:** sampled cache spans in application traces, tagged hit or miss.
+
+**Paging:** client error/latency burn rate, and hit ratio falling toward the DB-safe threshold. A completed failover is a notification.
+
+### Performance and cost
+
+**Bottleneck:** network and per-node hot spots, not CPU (50k ops/s per primary is well inside one process). Use `MGET` and pipelining to cut round trips, pooled or multiplexed connections (thousands of app servers × 20 nodes is a lot of sockets), and client-side compression for values above a few KB, trading app CPU for memory and bandwidth.
+
+**Cost drivers:**
+- **RAM: 40 × 64 GB ≈ 2.5 TB to hold 1 TB of data.** Dropping replicas for low-value keyspaces halves that, but a node failure then means a cold shard and a miss spike. Remove per-key overhead with packed hashes (follow-up): 50 B/key across 1B keys is 50 GB, about one node. Evict keyspaces with low hit ratios, which use memory and give little back.
+- **Cross-zone traffic.** 1 GB/s of client traffic is ~86 TB/day; with primaries in 3 zones about two thirds, ~58 TB/day, crosses zones. Replication adds ~8 TB/day (≈91k writes/s × 1 KB). Zone-local read replicas or near caches cut this, at the price of staleness.
+- **The cache's value is DB cost avoided:** without it the database would need to serve ~909k reads/s. Size the cache by the working set that keeps the hit ratio high, not by total data.
+
 ## Follow-up questions
 
 ### Why is Redis single-threaded for commands, and does that limit throughput?

@@ -244,6 +244,73 @@ The `for` clause stops one noisy sample from paging anyone.
 - Writers keep the active 2-hour chunk of each series in memory. 10M series × ~2 KB of head chunk and index ≈ 20 GB, spread over many writers by `series_id`.
 - **Cardinality** (the number of distinct series) drives memory and index size, not sample count. One metric tagged by `request_id` creates a new series per request. Enforce per-tenant limits on new series and reject unbounded tag values at ingest.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Purpose-built TSDB for samples.** Gorilla chunks get ~1.37 B/sample, against tens of bytes per row in Postgres or Cassandra (see the follow-up). Samples are append-only and never updated, so they need no ACID: a sample that lands a few seconds late or twice (Kafka replay) is harmless because the TSDB dedupes on `(series_id, timestamp)`.
+- **Postgres for rules, dashboards, silences and notification channels.** They are small, relational and human-edited; a half-saved rule or mis-scoped silence means missed pages, so they get transactions. Evaluators cache them, keeping Postgres off the hot path.
+- **CAP per path:** ingest and queries are **AP**. A dashboard missing the last 20 s is fine; refusing writes during an incident is not. Alerting is deliberately **AP with duplicates**: two evaluator replicas run each shard and the alert manager dedupes, because a duplicate page costs far less than a missed one. Config writes are **CP**.
+
+### Service boundaries and communication
+
+- **Ingest gateway** (stateless: auth, quotas, cardinality checks) is separate from **TSDB writers** (stateful, memory-heavy), so they scale on different signals.
+- **Alert evaluators** query through a **dedicated query pool**, not the one serving dashboards. That bulkhead is the main reason to split: a heavy 1-year dashboard must never delay a page.
+- **Alert manager** is separate because dedupe, grouping and silences need one stateful place that sees every firing alert.
+- **Sync vs async:** agent → gateway → Kafka is synchronous up to the ack. Kafka → writers/rollups is async. Evaluator → alert manager is an async push with retries. Alert manager → paging provider is a synchronous call with retries, sending a stable dedupe key so retries don't create duplicate incidents.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| TSDB writer crash | Up to 2 h of head chunks for its partitions lost from memory | Replay from WAL and Kafka offsets; a second writer replica consuming the same partitions serves queries meanwhile |
+| Cardinality explosion (a tag on `user_id`) | Writer memory grows past the ~20 GB head budget, then OOMs | Per-tenant active-series limits at the gateway; reject *new* series with a clear 429 while existing series keep flowing |
+| Expensive dashboard query | Query nodes saturate | Query timeouts, max-series and max-points limits, automatic rollup choice; alerts use their own pool (bulkhead) |
+| Paging provider down or slow | Firing alerts don't reach on-call | Timeouts, retries with backoff and jitter, then fail over to a second channel (SMS/email); undelivered notifications go to a DLQ that pages through the backup route |
+| Agents reconnect after a network partition | All buffered data arrives at once | Jittered agent flushes, `429 Retry-After` load shedding at the gateway, newest data first so alerts recover first |
+| Evaluator node loss | Its rule shard stops evaluating | Replica evaluator keeps running it; rules re-shard; pending timers resume from the checkpointed alert state |
+
+### High availability and disaster recovery
+
+- **Separate failure domain:** the stack runs in its own zones/accounts and, ideally, its own region away from the production systems it watches. A shared region outage would otherwise blind you exactly when you need it.
+- **SPOFs:** stateless gateways and query nodes across 3 zones; Kafka RF 3; two writer replicas per partition (doubling head memory to ~40 GB); paired evaluators; a clustered alert manager; Postgres with a synchronous standby.
+- **Targets:** acked samples have **RPO 0** within a region (Kafka). The **alerting path has an RTO under 2 minutes**, because the product promises alerts within ~1 minute. Dashboards and history can take **RTO 30 minutes** in a regional failover. Blocks in object storage replicate cross-region, giving history an RPO of about one 2-hour block.
+- **Backups:** Postgres PITR. Also keep alert rules as code in git so they can be restored or rebuilt from source; losing them is worse than losing a week of samples.
+
+### Security
+
+- **AuthN:** per-tenant API keys, with write-only keys for agents and separate read keys for dashboards/API; users sign in through SSO.
+- **AuthZ:** RBAC for editing rules and silences. Silencing is dangerous (it can hide a real outage), so silences require an expiry and are audited.
+- **Tenant isolation:** the tenant ID is part of the `series_id` hash and the inverted index. The query service adds the tenant filter itself, so one customer can never match another's series.
+- **Encryption:** TLS everywhere; encrypted disks and buckets with rotated KMS keys.
+- **Secrets:** paging integration keys and webhook secrets live in a secrets manager. Outbound webhooks are an SSRF risk, so allow-list destinations and block internal address ranges.
+- **PII:** tags sometimes leak emails or user IDs; reject known patterns at ingest.
+- **Audit:** rule, silence and channel changes, plus API key creation.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.9% of in-quota ingest batches get a 202.
+- 99% of samples are queryable within 30 s of receipt.
+- 99.9% of synthetic alert conditions produce a notification within 90 s (a canary rule that flips a test metric every few minutes).
+- 99% of last-hour dashboard queries finish within 1 s.
+
+**Dashboards:** Kafka lag per writer in seconds, active series per tenant against its limit, writer head memory, evaluation duration vs the 30 s interval (100k rules ≈ 3,333 evaluations/s), notification delivery success.
+
+**Tracing:** queries through index lookup and chunk fetches; alerts from evaluation to provider ack.
+
+**Paging:** canary-alert failures and the dead man's switch, ingest-error burn rate, and freshness burn. A writer near its memory limit opens a ticket.
+
+### Performance and cost
+
+**Bottleneck:** writer memory and query decompression. Tune with large Kafka batches, Gorilla chunks of 120 samples, automatic rollup selection, and cached results aligned to step boundaries (follow-up). Recording rules shrink the expensive alert queries.
+
+**Cost drivers:**
+- **Cardinality, not bytes.** Raw 15-day storage is only ~1.8 TB, but each active series costs ~2 KB of head memory, doubled for replicas. A tenant adding 5M series adds ~10 GB of RAM per replica. Price and limit by active series; the trade-off is friction for teams that need detailed tags.
+- **1-minute rollups.** 10M series × ~710 KB ≈ 7.1 TB for 90 days, about 4× the raw tier. Keeping 1-minute data for 30 days instead saves about two thirds of it, at the cost of coarser 31–90 day graphs.
+- **Cross-region ingest.** If agents ship from other regions at an assumed ~20 B/sample on the wire including tags, 1M samples/s is 20 MB/s ≈ 1.7 TB/day of egress. Pre-aggregating in a regional agent tier cuts this, at the cost of another component.
+- **Operational complexity.** Kafka, a TSDB, Flink and an alert manager are four systems to run; a managed backend trades per-series pricing for less on-call load.
+
 ## Follow-up questions
 
 ### How do you handle samples that arrive late or out of order?

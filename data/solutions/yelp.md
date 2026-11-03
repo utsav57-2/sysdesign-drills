@@ -200,6 +200,62 @@ For **ranking**, a raw average favors a business with one 5-star review. Sort by
 - **Freshness:** CDC (Debezium reads the Postgres WAL into Kafka) updates the search index within seconds. This avoids dual writes from the app, which can leave the two stores inconsistent when one write fails.
 - **Rating in search results** is denormalized into the search doc; a few seconds of lag is acceptable there because the details page reads the authoritative row.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Postgres is the source of truth** for businesses, reviews and users. The two hard requirements, one review per user per business and an average that never drifts, are both solved by relational features: a `UNIQUE` constraint and a multi-row transaction (review upsert + aggregate update). A document or wide-column store was rejected because you'd re-implement that transaction with conditional writes across two keys. At 12 writes/s and ~1 TB of reviews, Postgres isn't stretched.
+- **Elasticsearch is a derived read model**, never written by the app directly. If it's lost, you rebuild it from Postgres. That's why it can be eventually consistent.
+- **Redis is a disposable cache** for hot searches and first review pages.
+- **ACID:** review writes and rating aggregates (business reputation and money depend on them; a drifting average invites complaints from owners). **BASE:** search results, cached pages, the denormalized `avg_rating` in Elasticsearch, all a few seconds behind.
+- **CAP:** the write path is **CP**: if the Postgres primary is unreachable, return 503 on `PUT /review`; the client keeps the draft and retries. Search and viewing are **AP**: serve from replicas, Elasticsearch or cache even if they're stale. The asymmetry matches the ~100:1 read/write ratio: almost all users only read.
+
+### Service boundaries and communication
+
+- **Search service** (Elasticsearch + cache), **Business service** (details), and **Review service** (writes and review pages) are split because they have different scaling and failure profiles: search is CPU-heavy and read-only, reviews need transactions and stricter auth. Don't split "rating service" out of reviews: the aggregate must live in the same transaction as the review.
+- **Synchronous:** search, details view, and the review write (the user wants to see "posted"). **Asynchronous:** CDC → Kafka → indexer, fake-review scoring, cache invalidation for the first review page, and notifications to business owners. The CDC pipeline is the main async seam; it's why the app never dual-writes.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| Elasticsearch cluster degraded or slow | Search p99 blows past 500 ms | Timeout ~300 ms and circuit breaker in the search service; fall back to cached results for the same geohash6 cell, then to a simpler PostGIS query on read replicas with no text relevance (graceful degradation) |
+| CDC/indexer lag or crash | New reviews/businesses missing from search | Kafka retains changes so the indexer resumes from its offset; idempotent upserts by `business_id`; poison events to a DLQ; alert on lag |
+| Postgres primary failover | Review writes fail for ~30 s | Client retries with backoff + jitter; `PUT` is idempotent by design (upsert on `(business_id, user_id)`) |
+| Read replica lag | User posts a review then doesn't see it | Read-your-writes: route that user's next reads of that business to the primary for a short window |
+| Hot-area traffic spike (event downtown) | Search QPS concentrated on a few cells | Redis cache keyed by geohash6 absorbs repeats; rate limits per client; shed sort-by-relevance to cheaper distance sort under load |
+| Aggregate mismatch bug | Average drifts from truth | The periodic recompute job (deep dive) detects and repairs it, and alerts |
+
+### High availability and disaster recovery
+
+- **SPOFs:** the Postgres primary (synchronous standby in another zone with automatic failover) and the CDC connector (run it supervised with stored offsets so a restart resumes, not re-snapshots).
+- **Deployment:** multi-zone in each region. Businesses are local, so serve reads from several regions with Elasticsearch and Postgres read replicas, and keep writes in one primary region. Writes are rare and can take the extra cross-region latency.
+- **Backups:** daily Postgres snapshots plus WAL archiving for point-in-time restore (protects against a bad migration or a mass-deletion bug), copied cross-region. Elasticsearch doesn't need backups for correctness; snapshot it anyway to make a rebuild minutes instead of hours.
+- **RPO/RTO:** reviews RPO 0 within a region (sync standby), because a lost review is user-visible content gone; seconds cross-region. RTO: search under 5 minutes (it's what most users do), review writes under 30 minutes for a regional disaster.
+
+### Security
+
+- **Authn/authz:** OAuth tokens; the reviewer comes from the token (as noted). Users can only edit or delete their own review; business owners can reply but never edit reviews or ratings; moderators have a separate role, and every moderator hide/unhide is audit-logged with a reason, because those actions change a business's rating.
+- **Encryption:** TLS externally and between services; encryption at rest for Postgres, Kafka and backups.
+- **PII:** reviews are public, but user emails, IPs and device data used for fraud scoring are not. Keep fraud signals in a separate restricted store with short retention, and support account deletion, which is also an aggregate change.
+- **Abuse:** review bombing and fake reviews (see follow-up): rate-limit review writes per user and per business per hour. Scraping is the other big one: rate-limit search per API key and IP, and require keys for the public API.
+- **Secrets:** DB and Elasticsearch credentials in a secrets manager with automatic rotation.
+
+### Observability
+
+- **SLIs/SLOs:** 99.9% of searches succeed and 99% complete within 500 ms over 30 days; 99.9% of review writes succeed; 99% of review changes visible in search within 10 s (CDC end-to-end lag); zero unrepaired aggregate mismatches.
+- **Dashboards:** search QPS and latency by sort mode, cache hit rate, Elasticsearch query time and rejected requests, CDC lag (WAL position vs indexer offset), replica lag, review write rate and rejection reasons.
+- **Tracing:** search requests through gateway → search service → cache → Elasticsearch, tagged with radius and filters to spot expensive queries; review writes through the transaction and CDC with a correlation ID.
+- **Paging:** burn rate on search availability/latency and review write errors; CDC lag over a few minutes. Elasticsearch node loss with healthy SLOs is a ticket.
+
+### Performance and cost
+
+- **Bottleneck:** search at ~17k/s peak. The geohash6-keyed cache helps most for popular queries in dense areas. Inside Elasticsearch, filter on geo and category before scoring text, cap the radius (50 km), and keep the index small (10M docs, ~10 GB) so it fits in page cache on every node.
+- **Cost drivers:** Elasticsearch replicas are the biggest line item: each replica is another copy of the index plus heap. Size by peak QPS, not storage; adding cache hits is cheaper than adding replicas. Trade-off: cached results are up to 60 s stale.
+- **Reviews storage** grows ~1M/day × 1 KB ≈ 1 GB/day (~365 GB/year) on top of the 1 TB; move old review text to cheaper storage tiers or partitions after a few years, with the trade-off that deep pagination gets slower.
+- **Multi-region** read replicas and Elasticsearch clusters multiply cost; add regions where latency data shows users are far from the nearest one.
+- **Operational complexity:** CDC + Kafka + Elasticsearch is three systems to run. At smaller scale, PostGIS on read replicas alone is a defensible, cheaper choice.
+
 ## Follow-up questions
 
 ### How do you search a map viewport instead of a radius?

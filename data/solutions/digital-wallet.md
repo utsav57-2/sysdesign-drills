@@ -238,6 +238,68 @@ Internally, every saga step carries `transfer_id`, and each shard enforces `UNIQ
 - Match settlement-account entries against bank and processor reports; mismatches go to an operations queue.
 - Ledger entries are immutable: mistakes are fixed with new reversing entries, never edits, so the history tells the full story.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Ledger shards and transfers DB (Postgres): ACID, CP.** Every money invariant here is enforced by the database: the conditional debit, `CHECK (balance - held >= 0)`, `UNIQUE (transfer_id, account_id, entry_type)`, and the idempotency insert in the same transaction as the transfer. An eventually consistent store was rejected: two replicas accepting debits for one account during a partition is a double spend, real money plus regulatory exposure. In a partition, transfers touching the unreachable shard fail; correctness wins.
+- **Alternative worth naming: distributed SQL** (Spanner-style). It would make cross-shard transfers a single transaction and remove the saga between shards. Throughput at ~1.2k/s is fine; it wasn't chosen because external processors need a saga anyway and consensus on every commit adds latency and cost. Still defensible in an interview.
+- **Where BASE is fine:** notifications, search over transfers, analytics and counterparty-name enrichment, all fed from the outbox.
+- **Read paths:** balance reads go to the shard primary, because "a balance read after a transfer reflects it" is a requirement. Older history pages can use replicas.
+
+### Service boundaries and communication
+
+- **Ledger service** is the only writer of `accounts` and `ledger_entries`, enforced with database grants, not convention.
+- **Transfer service** orchestrates sagas; **balance/history service** scales reads separately; a **processor integration service** handles top-ups, withdrawals and webhooks, keeping external failures away from peer-to-peer transfers.
+- **Synchronous:** app → transfer service → ledger shards, each call with a timeout. Same-shard transfers return `201`; a cross-shard saga that doesn't finish within ~1–2 s returns `202` and the app polls. Processor calls are synchronous to request, but confirmation is asynchronous via webhooks.
+- **Asynchronous:** notifications, reconciliation, audit export, all through the outbox.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| One ledger shard's primary fails | With 16 shards, about 12% of transfers touch it (1 − (15/16)² ≈ 0.12) and fail or stall | Circuit breaker fails those fast while other shards continue; after failover (~30–60 s) the recovery worker resumes held transfers (deep dive) |
+| Credit step times out, outcome unknown | Funds held, receiver state unknown | Retry the same step with the same `transfer_id` using backoff and jitter; the unique constraint makes it a no-op if it already applied |
+| Card or bank processor slow or down | Top-ups and withdrawals stall | Separate connection and worker pools for processor calls (bulkhead) so P2P transfers are untouched; circuit breaker; requests stay `pending` and reconciliation queries the processor later |
+| Duplicate or out-of-order webhooks | Wallet credited twice, or status moves backwards | Verify the signature, dedupe on the processor's event ID, and let the state machine ignore transitions out of terminal states |
+| Notification consumer hits a poison event | Users aren't notified | Retry with backoff, then dead-letter queue with an alert; money state is already final |
+| Reconciliation finds a mismatch | Possible lost or created money | Never auto-correct. Alert, freeze outbound transfers on the affected accounts, fix with reversing entries after review |
+
+### High availability and disaster recovery
+
+- **Within a region:** each ledger shard and the transfers DB has a synchronous standby in another AZ, with automated failover that **fences** the old primary. Two primaries accepting debits would double-spend, so failover needs a quorum decision.
+- **Region loss: RPO 0 is the target**, because "money is never created or destroyed" also applies to disasters. That means a synchronous replica in a second region; each commit pays a cross-region round trip (tens of ms), affordable at 1.2k/s peak and invisible to a human tapping "send".
+- **RTO:** ~30–60 s for an AZ failover and ~15 minutes for a region, deliberately with a human confirming the old region is fenced. 99.99% (~52 min/year) leaves room for one region event.
+- **Backups:** daily snapshots plus continuous WAL archiving, in write-once storage under a separate account so a compromised admin can't delete them. Retain for the years financial regulation requires. Restores are verified with the reconciliation invariant checks.
+
+### Security
+
+- **AuthN:** OAuth tokens bound to a registered device; step-up authentication (PIN or biometric) for new payees, large amounts and withdrawals to a new bank account.
+- **AuthZ:** sender always comes from the token (API notes); history reads check account ownership. Service-to-service calls use mTLS, and the ledger DB role has **no UPDATE or DELETE permission on `ledger_entries`**, so append-only is enforced by the database.
+- **Encryption and secrets:** TLS in transit, KMS-backed encryption at rest. Bank account numbers get field-level encryption with a separate key; card data stays with the processor as tokens. Processor API keys and webhook signing secrets live in a secrets manager, rotated with an overlap window.
+- **Audit:** the ledger is the audit trail for money. Staff actions go in a separate access log, and manual adjustments need two-person approval and post as ledger entries from an operations account, never as direct balance edits.
+- **PII:** transfer notes and counterparties reveal relationships and habits. Restrict who can search them and set retention for notes separately from the ledger.
+- **Abuse:** per-user and per-device rate limits on transfers, daily amount limits that start low for new accounts, and velocity checks for account takeover. A risk check before the hold should fail **closed** for large amounts and may fail open for small ones, a trade-off between fraud loss and availability.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- 99.99% of valid transfer requests get a non-5xx response.
+- 99% of transfers reach a terminal state within 2 s, and 99.99% within 1 minute.
+- Ledger invariants hold: zero violations of "sum of entries = 0" and "balance = sum of entries". Any violation pages immediately.
+
+**Dashboards:** transfers by outcome (completed, failed, 422), saga step latency per shard, non-terminal transfers by age, total outstanding holds, idempotency replay rate, processor latency and errors, webhook lag, outbox lag, daily reconciliation differences. **Tracing:** `transfer_id` on every span across orchestrator, shards and processor; keep all failed or slow traces. **Paging:** SLO burn rates, any invariant violation, any transfer non-terminal for more than 5 minutes, and transfer volume per minute far off baseline in either direction.
+
+### Performance and cost
+
+**Bottleneck: commit latency, not throughput.** A same-shard transfer is one transaction; a cross-shard one is about five commits (transfer row, hold, credit, settle, final status), each waiting on synchronous replication. Co-locating a user's accounts and frequent counterparties raises the same-shard share, which helps more than any tuning. Add a connection pooler per shard, a partial index on non-terminal transfers for the recovery worker, and monthly ledger partitions.
+
+**Cost drivers:**
+- **The database fleet, not storage.** 16 shards × three copies is 48 Postgres instances for a workload one node could handle; 20 GB of accounts fits anywhere. Fewer shards cut cost but widen the blast radius of a shard failure.
+- **Ledger growth:** ~1.5 TB/year × 3 copies ≈ 4.5 TB/year, kept for years. Move old partitions to cheaper storage, keeping them queryable for audits.
+- **Cross-region sync replication:** little bandwidth (a few GB of ledger a day plus WAL overhead), but latency on every commit.
+- **Processor fees** are usually the largest variable cost: card top-ups cost more per transaction than bank transfers, so the product nudges users toward bank funding.
+
 ## Follow-up questions
 
 ### Why not let the client send the new balance or do the math?

@@ -240,6 +240,67 @@ Snowflake is unique only if a worker never reuses a (timestamp, sequence) pair. 
 
 Choose the split by asking: how many generators will ever exist, and how many IDs per millisecond does each need?
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Worker leases need a linearizable, CP store.** Two processes holding worker 37 at once can mint the same ID: a failed insert at best, an overwritten order at worst. So leases go in etcd or ZooKeeper (consensus-replicated), or a Postgres row updated in a transaction. **Rejected:** an AP store such as Cassandra, where two sides of a partition could each grant the same slot, and Redis with async replication, where a failover can lose a just-granted lease and hand it out again.
+- **Segment table (alternative design) needs ACID** for exactly the reason shown in the deep dive: the `UPDATE ... max_id + step` must be atomic under a row lock so two nodes never get overlapping ranges.
+- **`last_ts` is local state** on the host's disk. It only protects that host after a restart, so no replication.
+- **CAP stance:** the lease path is CP. A node that can't renew its lease must stop generating, choosing unavailability over a possible duplicate. The hot path is effectively AP because a node with a valid lease generates with no coordination at all.
+
+### Service boundaries and communication
+
+- **Library first, small service second** (as the follow-ups explain). The only shared pieces are the lease store and time sync, both off the per-call path.
+- **Synchronous:** claiming a worker ID at startup. The process stays not-ready until it has one, so a pod without a lease never receives traffic. `nextId()` is a local call; `GET /ids?count=100` is synchronous for polyglot clients.
+- **Asynchronous:** lease renewal on a background timer, periodic `last_ts` persistence, and chrony slewing the clock.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| etcd unavailable | Running generators are fine; new pods can't claim IDs, so scale-ups and deploys stall | Lease TTL (e.g. 30 s) comfortably longer than renewal interval; startup retries with exponential backoff and jitter so 1,000 pods don't stampede etcd when it returns |
+| Process paused (GC, VM freeze) longer than its lease | Lease expires, another process claims worker 37, the paused one wakes and keeps minting: duplicates | Track a local deadline on the monotonic clock; refuse to generate once `now > last_renewal + TTL − margin`, then re-claim |
+| Large clock step backwards | That node can't safely generate | Refuse and fail readiness (deep dive); the load balancer or caller moves to other nodes |
+| Worker-ID pool exhausted (pod churn, more than 1,024 processes) | New pods fail to start | Alert at 80% utilization; shorter TTLs so dead pods free slots faster; give high-churn batch jobs segment allocation instead |
+| ID service node slow or down | Polyglot callers wait | Short client timeout, retry another node. Retries are always safe: a lost batch just leaves a gap |
+| A duplicate slips through anyway | Insert fails on the unique primary key | Treat any duplicate-key error on a generated ID as sev-1: a lease or clock invariant broke |
+
+### High availability and disaster recovery
+
+- **No SPOF on the hot path.** Every service embeds the generator; the ID service runs across three zones behind a load balancer. etcd runs 3 or 5 members across three zones and is needed only for claims and renewals.
+- **Regions never coordinate.** Give each region a disjoint slice of worker IDs (Twitter used 5 of the 10 bits for the data center) and its own etcd. A cross-region partition then can't cause collisions, and losing a region has **RTO 0** for ID generation everywhere else.
+- **RPO is mostly not applicable:** the generator holds no business data. The one trap is the lease store. **Never restore etcd leases from a backup**: an hours-old snapshot would show slots as free that live processes still hold. If the lease store is lost, rebuild it empty and make every generator wait one full TTL before claiming again. That wait also guarantees the previous holder of a slot has stopped.
+- **Availability target:** ID generation sits on the write path of every service that uses it, so it needs at least the availability of its most critical consumer, e.g. 99.99%.
+
+### Security
+
+- **IDs are not secrets** (out of scope), but they enable enumeration: anyone holding one can guess neighbours. Every API that takes an ID must check ownership, not just existence. For public URLs, expose a random or encrypted public ID instead.
+- **Information leakage:** `decode` reveals creation time and worker; sequence values hint at volume.
+- **Lease store access control:** mTLS plus etcd RBAC so only the generator's service identity can write under the `/workers` prefix. A buggy script deleting a live lease causes duplicates, so audit every lease grant, release and manual override.
+- **ID service:** mTLS for authn, an allow-list of calling services for authz, `count` capped (e.g. at 1,000) and a per-caller rate limit so one caller can't burn a node's CPU.
+- **Encryption:** TLS in transit for etcd and the ID service. Leases hold only host names, so encryption at rest matters little.
+
+### Observability
+
+**SLIs and SLOs (30 days):**
+- **Uniqueness:** zero duplicate-key errors caused by generated IDs. This is an invariant, not a percentage; any occurrence pages.
+- **Availability:** 99.999% of `nextId()` calls succeed (they fail only on a large clock rollback or lost lease).
+- **ID service latency:** 99% of `GET /ids?count=100` calls complete within 5 ms in-zone.
+
+**Metrics:** clock-rollback events and size, chrony offset per host, sequence-exhaustion waits per second, lease-pool utilization, lease renewal failures and time remaining, etcd request latency and leader changes. **Tracing:** never per ID; trace ID-service batch calls only. **Paging:** duplicate keys, ID-service error-budget burn, and the same clock-offset alarm firing on many hosts at once (a fleet-wide time problem is about to become a correctness problem).
+
+### Performance and cost
+
+**Bottleneck: contention inside `nextId()`**, not throughput (4.096M IDs/s per worker). With dozens of threads, a mutex becomes a hot spot; pack `(timestamp, sequence)` into one 64-bit word and update it with compare-and-swap. For the service, batching amortizes the round trip: 1M IDs/s in batches of 100 is only 10k requests/s.
+
+**Downstream performance trade-off:** time-ordered keys append to the right edge of a B-tree, which is cache-friendly for single-node databases. In range-partitioned stores the same property sends all inserts to the last range, a hot spot. Hash-partition such tables, or prefix the key with a shard ID as Instagram does.
+
+**Cost drivers:**
+- **The generator itself is nearly free:** a few etcd nodes and a small ID-service fleet.
+- **Key size downstream is the real cost.** 64-bit instead of 128-bit keys save ~8 GB per index per billion rows, and in clustered-index engines such as InnoDB every secondary index carries the primary key, so the saving repeats per index.
+- **Operational complexity:** etcd-based leasing is another cluster to run. Static StatefulSet ordinals avoid it but rely on configuration being right; segment allocation swaps it for one DB write per 1,000 IDs.
+
 ## Follow-up questions
 
 ### Why not just use UUIDs everywhere?

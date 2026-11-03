@@ -251,6 +251,71 @@ Timeline for one post: t = 0 s committed, t ≈ 0.2 s on Kafka, t ≈ 0.5 s in a
 - **Posting list cache:** frequently used posting lists and skip data stay in RAM on each shard; the OS page cache does much of this for free.
 - **Short TTLs** keep freshness: a trending query's results are at most a minute old.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Document store (Cassandra or Bigtable) is the source of truth.** 100 TB, ~5,800 writes/s, single-key reads by `doc_id`, no joins: a relational database would need hand-built sharding and add nothing. Writes need quorum durability before the 202, because the index can be rebuilt but a lost post cannot.
+- **The inverted index is a derived, eventually consistent view.** BASE is right: a post can be unsearchable for ~1.5 s and nobody is harmed. Search reads are AP. If a shard is unreachable, return partial results from the other 199 rather than an error, as the requirements say.
+- **The exception is deletes and visibility.** Showing a deleted or friends-only post to the wrong person is a privacy incident, not a quality blip. So the final visibility check reads the document store's current state (quorum read on Cassandra, or Bigtable's single-row strong reads), and it **fails closed**: if that check can't complete, drop non-public results instead of showing them.
+- **Shard map in ZooKeeper/etcd (CP).** Two replicas both believing they are primary for shard 17 would diverge silently. During a partition, it is better to pause indexing on that shard than to split-brain.
+- **Redis query cache** is pure BASE: a 60 s TTL, no persistence, and losing it costs only latency.
+
+### Service boundaries and communication
+
+- **Query service** is stateless fan-out and merge, scaled on QPS. **Search shards** are stateful, scaled on index size, and replaced slowly. They are split because their scaling and deployment cadence differ.
+- **Re-ranker** is separate because its ML model needs different hardware and ships on the ranking team's schedule.
+- **Indexers** are split from the content service so analyzer bugs or slow shards never block posting: writes are async via Kafka, queries sync scatter-gather with a deadline (deep dive).
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| One shard replica slow (GC pause, merge storm) | Tail latency of every uncached query | Per-shard deadline, hedged request to another replica, partial results after the deadline (see deep dive) |
+| Re-ranker down or slow | Latency or errors on cache misses | ~50 ms timeout, then return BM25 order; circuit breaker opens on error rate so requests stop paying the timeout |
+| Poison document crashes the analyzer | Indexer partition stalls; freshness breaks for 1/N of docs | Bounded retries with exponential backoff and jitter, then send to a DLQ with the offset and move on; DLQ is replayed after a fix |
+| Indexing backlog (viral spike, bulk import) | New posts miss the 5 s SLO | Autoscale indexers on lag; separate topics keep deletes and live posts ahead of backfills |
+| Redis cache cluster lost | Up to 35k QPS falls straight onto shards | Request coalescing for identical queries, shed deep-page and anonymous traffic first, per-client rate limits |
+| Document store slow | Snippet and visibility fetch stall | Short timeout; return titles without snippets for public docs; drop non-public results (fail closed) |
+
+### High availability and disaster recovery
+
+- **Within a region:** 3 replicas per shard spread across 3 zones, so a zone loss leaves 2 copies of every shard. A replica lost for good is rebuilt from a peer or from blob segments: 50 GB copies in minutes. The coordination service runs 5 nodes across 3 zones, so it keeps quorum through a zone outage.
+- **Across regions:** run a full index stack in each serving region, fed by its own indexers from replicated document changes. Don't copy segments between regions. The changes cost ~5,800 docs/s × 1 KB ≈ 5.8 MB/s, or ~500 GB/day of egress per extra region. Copying segments would ship every background merge again and cost far more.
+- **Backups and RPO:** the document store is the source of truth (RF 3, cross-region replica), with an RPO of seconds. The index's effective RPO is zero because it is derived, but its **RTO** is the problem: replaying 100B documents at the live rate of 5,800/s would take 100B ÷ 5,800 ≈ 17M s, about 200 days. So snapshot segments to blob storage hourly, and keep Kafka retention (e.g. 3 days) well above the snapshot interval. Restore is then "load snapshot plus replay a few hours", giving shard-level RTO in minutes and region-level RTO of hours. Meanwhile DNS fails users over to another region in under 5 minutes.
+
+### Security
+
+- **Authn/authz:** the viewer comes from the token. Visibility filtering is the authorization layer, applied after the shared cache and re-checked against the document store. The cached entry holds only IDs, never pre-rendered private snippets.
+- **Internal index API** is reachable only by the content service and indexers over mTLS. A forged `DELETE /internal/index` is effectively censorship.
+- **Query logs are sensitive** (health, legal, and personal searches). Keep user-linked logs for a short window (e.g. 30 days), then aggregate or anonymize them for ranking work, and audit-log every analyst access.
+- **Encryption:** TLS everywhere; document store and segment backups encrypted at rest with KMS keys rotated on a schedule.
+- **Abuse:** rate-limit per user and IP (the 429); cap query length and term count and disallow leading wildcards so one crafted query can't scan huge posting lists; HMAC-sign cursors and cap pagination depth to slow scraping.
+
+### Observability
+
+- **SLIs and SLOs (30 days):**
+  - 99.9% of queries return a successful response.
+  - 99% complete within 500 ms.
+  - 99% of new documents are searchable within 5 s, measured by a synthetic canary that posts and then queries a document every few seconds.
+  - 99.9% of deletes are invisible within 5 s.
+- Also track a **completeness** SLI: the share of queries where all 200 shards answered. Partial results are allowed, but they shouldn't become normal.
+- **Dashboards:** per-shard p99 heatmap, hedge rate, cache hit ratio, Kafka lag per topic, merge times and segment counts, DLQ depth.
+- **Tracing:** a full trace is 200+ spans, so use tail-based sampling that keeps slow and errored queries. That makes "which shard was slow" answerable.
+- **Paging:** burn-rate alerts on availability, latency and the freshness/delete canaries. A single replica dying or a high merge rate is a ticket, not a page.
+
+### Performance and cost
+
+**Bottleneck:** tail latency of a 200-way fan-out, plus posting-list intersection on cache misses. Beyond what the deep dives cover (hedging, hot tier, early termination, compression), there are two levers:
+- Batch index writes into bulk requests of a few hundred documents, which cuts per-request overhead and segment churn.
+- Keep each 50 GB shard sized so its hot postings stay in page cache.
+
+**Cost drivers:**
+- **Index serving footprint:** 600 copies × 50 GB = 30 TB of RAM or fast SSD per region. This is the biggest line item. Run older time tiers on cheaper SSD with 2 replicas instead of 3, since they serve a small share of queries. The trade-off is less headroom when an old-tier node fails.
+- **Document store:** 100 TB × RF 3 = 300 TB. Compress text (often 2–4× for prose) and move cold documents to cheaper storage tiers, at the cost of slower snippet fetches for old results.
+- **Re-ranker compute** scales with cache misses. Raising the cache hit ratio from 50% to 70% cuts that load by 40%. It also makes results up to a minute staler.
+- **Each extra region** duplicates the 30 TB fleet; small regions can query a nearby large one instead, paying ~50–100 ms. Segment backups stay cheap because immutable segments upload incrementally.
+
 ## Follow-up questions
 
 ### How do you show only posts the viewer is allowed to see?

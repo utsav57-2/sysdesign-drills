@@ -219,6 +219,78 @@ With integer positions, inserting at position 2 of a 10,000-track playlist rewri
 - **Concurrent edits:** every change bumps `version`; writes carry `If-Match`, and a 412 makes the client refetch and reapply its change. For collaborative playlists, append operations commute (each gets a unique key), so most conflicts resolve automatically.
 - **Hot playlists** (official charts followed by millions) are read-mostly: cache them at the CDN or in Redis by `(playlist_id, version)`, so a new version is simply a new cache key.
 
+## Production readiness
+
+### Database choice and consistency
+
+- **Audio in blob storage, never a database.** 1.5 PB of immutable objects read by byte range fits object storage plus a CDN. A database adds transactions nobody needs.
+- **Catalog metadata in Postgres behind Redis.** Tracks, albums, artists and per-market rights are relational and change slowly; the ~46k reads/s for track starts are almost all cache hits. A wide-column store would scale writes we don't have. Rights changes commit atomically; reads can be minutes stale.
+- **Playlists in sharded Postgres, ACID per playlist.** The `If-Match` version check and the item insert must happen in one transaction, or two devices lose each other's edits. All rows for one playlist live on one shard, so no cross-shard transactions are needed.
+- **Play events are BASE with strict reconciliation.** Kafka plus the data lake gives at-least-once ingestion. Idempotency keys and the daily reconciliation turn that into accurate royalty counts. Payouts need eventual correctness, not a transaction per play.
+- **CAP stance:**
+  - Playback is AP. The requirements say it must survive regional and dependency failures, so cached entitlements and licenses are honoured until they expire, rather than blocking on a live check.
+  - Playlist writes are CP per shard: a 412 or a brief write outage beats a silent lost edit, while reads can come from a stale replica.
+  - Search is AP.
+
+### Service boundaries and communication
+
+- **Playback, license, search, playlist, ingestion and event intake** are separate so their blast radius differs: people must keep listening while search or playlists are down, so playback has no synchronous dependency on them.
+- **Synchronous:** URL signing, license fetch (cached on the client per `keyId`), search, playlist reads and writes. The user waits for all of these.
+- **Asynchronous:** play events into Kafka, CDC into Elasticsearch, daily popularity scores, and ingestion, where a job queue fans out transcode tasks and publishes the track only once every codec and bitrate exists.
+
+### Failure modes and reliability
+
+| Failure | Effect | Mitigation |
+|---|---|---|
+| A CDN provider or POP degrades | Slow starts or rebuffering in one geography | Client switches to the second `cdnUrl` on a short connect/first-byte timeout; traffic steering shifts share away from the provider using client-reported metrics |
+| Playback service or metadata DB slow | New tracks can't start | Redis plus in-process caches with stale-while-revalidate; prefetched signed URLs keep queued tracks playing; strict timeouts so gateway threads aren't tied up |
+| License service outage | Cold tracks can't decrypt | Licenses cached per key on device (offline licenses last ~30 days); license service runs on its own isolated capacity (bulkhead) |
+| Typeahead overload on search | Search slow or erroring | Client debounce, prefix result cache, circuit breaker in the gateway; load shedding returns cached top results; playback unaffected |
+| Release-time stampede on origin | Shield and blob storage swamped | Pre-warming and shield request coalescing (deep dive); rate-limited origin fetches |
+| Transcode fails on a malformed master | Track missing bitrates | Retries with exponential backoff and jitter, then a DLQ for manual review; track isn't published until complete |
+
+### High availability and disaster recovery
+
+- **Playback** runs active-active in several regions. Metadata is replicated read-only into each one, which is easy because the catalog is small and slow-changing. Clients carry two CDN URLs, so the edge has no single provider as a SPOF.
+- **Playlist DB:** each shard's primary has a synchronous standby in another zone, plus an asynchronous cross-region replica. Zone failure gives RPO 0 and an automatic failover in about a minute. Region failure gives RPO of seconds and RTO of ~15 minutes, during which playlists stay readable from the replica.
+- **Masters are the crown jewels.** Label deliveries are irreplaceable, so they go in versioned, write-protected storage in a separate account and region. Encoded files can be regenerated from masters. So the 4.5 PB of encodes needs cross-region copies only for availability, not for recovery.
+- **Play events:** Kafka with RF 3 and `acks=all`, mirrored cross-region, with RPO ≈ 0 once acked. Unacked events sit in the client's queue, which is the design's real buffer.
+- **Targets:** 99.95% of play attempts succeed; playback RTO is seconds (client failover); playlist and search RTO is minutes.
+
+### Security
+
+- **Authn:** OAuth tokens for users. Device registration binds license keys to devices.
+- **Authz:** entitlement and market are checked before signing URLs. CDN edges verify the HMAC and expiry without calling back. Signing keys carry a key ID, so they can be rotated with an overlap window where edges accept old and new.
+- **Content keys** live in a KMS/HSM-backed key store and are only released wrapped for an entitled device. Access to keys and masters is audit-logged, as are royalty-data corrections.
+- **PII:** listening history is personal data. Keep it pseudonymised in the lake with role-restricted access. Payment details stay with a payment processor; we hold only tokens.
+- **Abuse:** stream farming is the main attack, because plays mean money: bot accounts loop 31-second plays. Detect it in the stream processor (shared IPs or devices, inhuman patterns) and exclude those plays before payouts. Also limit concurrent streams per account, license requests per device and search calls per client.
+
+### Observability
+
+- **Client-side telemetry is primary.** The CDN is third-party, so server metrics alone are blind to most failures.
+- **SLIs and SLOs (30 days):**
+  - 99% of cold track starts play within 1 s.
+  - Rebuffering under 1% of play time.
+  - 99.95% of play attempts succeed.
+  - 99% of typeahead requests answered within 200 ms.
+  - 99.99% of acked play events land in the lake within 1 hour.
+- **Dashboards:** start time and rebuffer ratio sliced by CDN provider, POP, ISP and app version; edge and shield hit ratios; license errors.
+- **Tracing:** a correlation ID flows from the playback API call through to the client's CDN fetch, so a slow start can be split into API, DNS/TLS and first-byte time.
+- **Paging:** burn-rate alerts on start success and start latency per region or per CDN. A falling cache hit ratio on one POP is a ticket.
+
+### Performance and cost
+
+**Bottleneck:** cold-start latency through the edge → shield → blob chain (deep dive). Signing at 46k starts/s is a cheap HMAC as long as metadata is cached. Beyond that, reuse HTTP/2 connections and TLS sessions to the edge so a track start costs no fresh handshake.
+
+**Cost drivers:**
+- **CDN egress dominates everything.** 4B plays × ~4.2 MB (a full 160 kbps track) ≈ 17 PB/day, about 500 PB/month. That averages ~1.6 Tbps against the 4.8 Tbps peak. Levers:
+  - **Client cache hits:** each 10% saves ~1.7 PB/day, at the cost of disk space on the user's device.
+  - **Smart bitrate defaults:** 320 kbps doubles bytes per stream over 160, so default to 160 on mobile.
+  - **A more efficient codec:** same quality at lower bitrate, but every track must be re-transcoded and older clients still need the old files.
+  - **Committed-volume CDN contracts or an own edge**, which is cheaper at this scale but a big operational investment.
+- **Storage:** 4.5 PB is small next to egress. Long-tail files can use an infrequent-access class, never archive tiers, which would break the 1 s cold start.
+- **Search:** keystroke traffic runs several times 11.6k QPS, so the prefix cache is the cost lever. It trades a few minutes of staleness for far fewer Elasticsearch nodes.
+
 ## Follow-up questions
 
 ### How does offline mode work?
